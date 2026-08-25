@@ -10,6 +10,7 @@ from gear_sonic.sonic_lab.assets.g1_sonic import (
     G1_SONIC_CFG,
     SONIC_NUM_JOINTS,
     make_g1_sonic_cfg,
+    repo_root,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "G1_SONIC_CFG",
     "SONIC_NUM_JOINTS",
     "make_g1_sonic_cfg",
+    "repo_root",
 ]

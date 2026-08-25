@@ -147,3 +147,23 @@ def test_pipeline_builds() -> None:
         combiner, "output_mapping", {}
     )
     assert list(mapping.keys()) == ["action"]
+
+
+def test_isaaclab_quat_conversion_is_wxyz() -> None:
+    """Isaac Lab 3.0 hands out XYZW; gear_sonic's helpers are all ``w_last=False``.
+
+    Regression guard: feeding an Isaac Lab quaternion straight into ``calc_heading_quat`` yields a
+    valid-looking unit quaternion with the wrong orientation, which corrupted the heading term and
+    made the robot spin continuously. See ``migrating_to_isaaclab_3-0.rst:1317``.
+    """
+    from gear_sonic.sonic_lab.mdp.actions import isaaclab_quat_to_wxyz
+
+    # XYZW ordering, distinct components so a wrong permutation cannot pass.
+    quat_xyzw = torch.tensor([[0.1, 0.2, 0.3, 0.9]])
+    expected_wxyz = torch.tensor([[0.9, 0.1, 0.2, 0.3]])
+    torch.testing.assert_close(isaaclab_quat_to_wxyz(quat_xyzw), expected_wxyz)
+
+    # Batched / multi-frame inputs keep their leading dims.
+    batched = torch.randn(4, 10, 4)
+    assert isaaclab_quat_to_wxyz(batched).shape == batched.shape
+    torch.testing.assert_close(isaaclab_quat_to_wxyz(batched)[..., 0], batched[..., 3])

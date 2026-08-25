@@ -40,33 +40,70 @@ from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
     SonicFullBodyRetargeterConfig,
 )
 
-__all__ = ["DEFAULT_BODY_TRACKER_VENDOR", "build_sonic_fullbody_pipeline"]
+__all__ = [
+    "DEFAULT_BODY_TRACKER_VENDOR",
+    "build_sonic_fullbody_pipeline",
+    "build_sonic_fullbody_replay_pipeline",
+    "make_sonic_fullbody_pipeline_builder",
+]
 
 #: DeviceIO vendor string for PICO body tracking (``XR_BD_body_tracking``).
 #: Upstream ``gear_sonic`` reaches the same backend via the ``FullBodyTrackerPico`` subclass.
 DEFAULT_BODY_TRACKER_VENDOR = "body.pico-xr"
 
+#: MCAP channel base name that :class:`FullBodySource` records/replays under.
+BODY_CHANNEL_NAME = "full_body"
+
+
+def make_sonic_fullbody_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_VENDOR):
+    """Create a ``pipeline_builder`` callable for ``IsaacTeleopCfg``.
+
+    Args:
+        vendor: DeviceIO tracker vendor id, or ``None`` to leave the tracker's default.
+
+            **Must be ``None`` for MCAP replay.** ``TeleopSession`` rejects vendor-carrying
+            sources when ``mode`` is ``SessionMode.REPLAY`` (see
+            ``teleop_session.py:313-333``): replay reads the recorded channel regardless of
+            vendor, so a vendor selection would be silently ignored and it fails fast instead.
+
+    Returns:
+        A zero-argument callable returning the pipeline's ``OutputCombiner``.
+    """
+
+    def _build() -> OutputCombiner:
+        if vendor is None:
+            body = FullBodySource(name=BODY_CHANNEL_NAME)
+        else:
+            from isaacteleop.deviceio import TrackerVendor
+
+            body = FullBodySource(name=BODY_CHANNEL_NAME, vendor=TrackerVendor(vendor))
+
+        retargeter = SonicFullBodyRetargeter(
+            SonicFullBodyRetargeterConfig(),
+            name="sonic_fullbody",
+        )
+        connected = retargeter.connect(
+            {"full_body": body.output(FullBodySource.FULL_BODY)},
+        )
+        return OutputCombiner({"action": connected.output("sonic_reference")})
+
+    return _build
+
 
 def build_sonic_fullbody_pipeline() -> OutputCombiner:
-    """Build the XR-full-body -> SONIC-reference retargeting pipeline.
+    """Live-session pipeline: XR full-body tracking -> SONIC reference.
 
     Returns:
         An ``OutputCombiner`` whose single ``"action"`` output is the 83-wide SONIC reference
         frame described in :mod:`~gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter`.
     """
-    from isaacteleop.deviceio import TrackerVendor
+    return make_sonic_fullbody_pipeline_builder()()
 
-    body = FullBodySource(
-        name="full_body",
-        vendor=TrackerVendor(DEFAULT_BODY_TRACKER_VENDOR),
-    )
 
-    retargeter = SonicFullBodyRetargeter(
-        SonicFullBodyRetargeterConfig(),
-        name="sonic_fullbody",
-    )
-    connected = retargeter.connect(
-        {"full_body": body.output(FullBodySource.FULL_BODY)},
-    )
+def build_sonic_fullbody_replay_pipeline() -> OutputCombiner:
+    """MCAP-replay pipeline: identical graph, but with no vendor selection.
 
-    return OutputCombiner({"action": connected.output("sonic_reference")})
+    Use with ``IsaacTeleopCfg`` when the teleop session runs in ``SessionMode.REPLAY``, so an
+    end-to-end environment test can be driven from a recording with no headset attached.
+    """
+    return make_sonic_fullbody_pipeline_builder(vendor=None)()

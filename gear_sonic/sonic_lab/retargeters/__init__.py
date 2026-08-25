@@ -4,7 +4,11 @@
 
 """Isaac Teleop retargeters producing SONIC reference frames."""
 
-from gear_sonic.sonic_lab.retargeters.pipeline import build_sonic_fullbody_pipeline
+from gear_sonic.sonic_lab.retargeters.pipeline import (
+    build_sonic_fullbody_pipeline,
+    build_sonic_fullbody_replay_pipeline,
+    make_sonic_fullbody_pipeline_builder,
+)
 from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,
     SonicFullBodyRetargeter,
@@ -18,4 +22,6 @@ __all__ = [
     "SonicFullBodyRetargeterConfig",
     "SonicReferenceSlice",
     "build_sonic_fullbody_pipeline",
+    "build_sonic_fullbody_replay_pipeline",
+    "make_sonic_fullbody_pipeline_builder",
 ]
