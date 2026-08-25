@@ -1,0 +1,149 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Differential tests: the Isaac Lab retargeter vs. the shipped PICO teleop server.
+
+:class:`SonicFullBodyRetargeter` is a restructuring of the retargeting inside
+``gear_sonic/scripts/pico_manager_thread_server.py``. These tests assert it is *numerically
+identical* to that reference, so the Isaac Lab path and the real-robot path feed SONIC the same
+numbers.
+
+Run from the repo root with Isaac Lab's interpreter::
+
+    /path/to/IsaacLab/.venv/bin/python -m pytest gear_sonic/sonic_lab/tests -q
+"""
+
+from __future__ import annotations
+
+import sys
+from unittest import mock
+
+import numpy as np
+import pytest
+from scipy.spatial.transform import Rotation as sRot
+import torch
+
+# The upstream server imports pyzmq at module scope for transport only; none of the retargeting
+# math touches it. Stub it so this test runs in an Isaac Lab venv without pulling in pyzmq.
+sys.modules.setdefault("zmq", mock.MagicMock())
+
+from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (  # noqa: E402
+    SONIC_REFERENCE_DIM,
+    _SMPL_PARENT_INDICES,
+    SonicFullBodyRetargeter,
+    SonicFullBodyRetargeterConfig,
+    SonicReferenceSlice,
+)
+from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa  # noqa: E402
+
+import gear_sonic.scripts.pico_manager_thread_server as upstream  # noqa: E402  isort: skip
+
+_TOL = 1e-5
+
+
+def _make_body_frame(seed: int) -> np.ndarray:
+    """Synthesize one ``(24, 7)`` XR body frame: ``[x, y, z, qx, qy, qz, qw]`` per joint."""
+    rng = np.random.default_rng(seed)
+    positions = rng.normal(size=(24, 3)).astype(np.float32)
+    quats = rng.normal(size=(24, 4)).astype(np.float32)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+    return np.concatenate([positions, quats], axis=1).astype(np.float32)
+
+
+def _upstream_wrists(smpl_pose: torch.Tensor) -> np.ndarray:
+    """Re-derive the six G1 wrist angles exactly as ``pico_manager_thread_server.py:1418-1476``."""
+    pose = smpl_pose.detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)
+    axis = np.array([0, 1, 0])
+    _, l_swing = decompose_rotation_aa(pose[:, 17], axis)
+    _, r_swing = decompose_rotation_aa(pose[:, 18], axis)
+    l_swing_e = sRot.from_quat(l_swing[:, [1, 2, 3, 0]]).as_euler("XYZ")
+    r_swing_e = sRot.from_quat(r_swing[:, [1, 2, 3, 0]]).as_euler("XYZ")
+    l_wrist_e = sRot.from_rotvec(pose[:, 19]).as_euler("XYZ")
+    r_wrist_e = sRot.from_rotvec(pose[:, 20]).as_euler("XYZ")
+
+    joint_pos = np.zeros(29)
+    joint_pos[23] = l_swing_e[:, 0][0] + l_wrist_e[:, 0][0]
+    joint_pos[25] = -(-l_wrist_e[:, 1][0])
+    joint_pos[27] = l_swing_e[:, 2][0] + l_wrist_e[:, 2][0]
+    joint_pos[24] = -(r_swing_e[:, 0][0] + r_wrist_e[:, 0][0])
+    joint_pos[26] = -r_wrist_e[:, 1][0]
+    joint_pos[28] = r_swing_e[:, 2][0] + r_wrist_e[:, 2][0]
+    return joint_pos[[23, 24, 25, 26, 27, 28]]
+
+
+@pytest.fixture
+def retargeter() -> SonicFullBodyRetargeter:
+    return SonicFullBodyRetargeter(
+        SonicFullBodyRetargeterConfig(device="cpu"), name="test"
+    )
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
+def test_matches_upstream(retargeter: SonicFullBodyRetargeter, seed: int) -> None:
+    """SMPL joints, root quaternion and wrist angles all match the shipped implementation."""
+    body = _make_body_frame(seed)
+    expected = upstream.compute_from_body_poses(
+        _SMPL_PARENT_INDICES, torch.device("cpu"), body
+    )
+    actual = retargeter._retarget(body)  # noqa: SLF001
+
+    np.testing.assert_allclose(
+        actual[SonicReferenceSlice.SMPL_JOINTS],
+        expected["smpl_joints_local"].reshape(-1).numpy(),
+        atol=_TOL,
+    )
+    np.testing.assert_allclose(
+        actual[SonicReferenceSlice.ROOT_QUAT],
+        expected["global_orient_quat"].reshape(-1).numpy(),
+        atol=_TOL,
+    )
+    np.testing.assert_allclose(
+        actual[SonicReferenceSlice.WRIST_JOINT_POS],
+        _upstream_wrists(expected["smpl_pose"]),
+        atol=_TOL,
+    )
+
+
+def test_output_layout(retargeter: SonicFullBodyRetargeter) -> None:
+    """The flat frame is the advertised width and flags itself valid."""
+    frame = retargeter._retarget(_make_body_frame(1))  # noqa: SLF001
+    assert frame.shape == (SONIC_REFERENCE_DIM,) == (83,)
+    assert frame.dtype == np.float32
+    assert frame[SonicReferenceSlice.VALID] == pytest.approx(1.0)
+
+
+def test_holds_last_good_frame_on_tracking_loss(
+    retargeter: SonicFullBodyRetargeter,
+) -> None:
+    """After a good frame, a dropout re-emits it with the valid flag cleared."""
+    good = retargeter._retarget(_make_body_frame(1))  # noqa: SLF001
+    retargeter._last_good = good  # noqa: SLF001
+    retargeter._have_good_frame = True  # noqa: SLF001
+
+    held = retargeter._fallback_frame()  # noqa: SLF001
+    assert held[SonicReferenceSlice.VALID] == pytest.approx(0.0)
+    np.testing.assert_array_equal(
+        held[SonicReferenceSlice.SMPL_JOINTS], good[SonicReferenceSlice.SMPL_JOINTS]
+    )
+
+
+def test_zeros_before_first_good_frame() -> None:
+    """With no good frame yet, the fallback is all zeros rather than stale garbage."""
+    fresh = SonicFullBodyRetargeter(
+        SonicFullBodyRetargeterConfig(device="cpu"), name="fresh"
+    )
+    np.testing.assert_array_equal(
+        fresh._fallback_frame(), np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)  # noqa: SLF001
+    )
+
+
+def test_pipeline_builds() -> None:
+    """The retargeting graph wires up and exposes a single ``action`` output."""
+    from gear_sonic.sonic_lab.retargeters.pipeline import build_sonic_fullbody_pipeline
+
+    combiner = build_sonic_fullbody_pipeline()
+    mapping = getattr(combiner, "_output_mapping", None) or getattr(
+        combiner, "output_mapping", {}
+    )
+    assert list(mapping.keys()) == ["action"]
