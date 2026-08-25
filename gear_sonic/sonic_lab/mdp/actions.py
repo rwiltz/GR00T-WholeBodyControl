@@ -99,7 +99,7 @@ class SonicWholeBodyActionCfg(ActionTermCfg):
     action_scale: dict[str, float] = MISSING
     """Per-joint action scale, keyed by joint-name regex (``G1_MODEL_12_ACTION_SCALE``)."""
 
-    policy_device: str = "cpu"
+    policy_device: str = "cuda:0"
     """Device for ONNX inference. See the module note on CPU cost at 50 Hz."""
 
 

@@ -34,6 +34,23 @@ Terms outside the active mode stay zero; the deploy stack does the same rather t
 .. note::
    Both graphs are exported with a **fixed batch size of 1**, so this runner drives a single
    environment. Multi-env rollouts would need a re-export with a dynamic batch axis.
+
+GPU execution
+-------------
+The decoder is ~37M parameters. On CPU it costs ~17 ms per step against a 20 ms control period at
+50 Hz, which alone puts the environment below real time; on CUDA it is ~0.7 ms. Install a runtime
+whose CUDA major version matches torch's::
+
+    uv pip install --python <isaaclab-venv>/bin/python onnxruntime-gpu==1.22.0
+
+Version matters: ``onnxruntime-gpu`` 1.28 links CUDA 13 and fails to load against a
+``torch==2.11.0+cu128`` environment (``libcublasLt.so.13: cannot open shared object file``). The
+1.22 line targets CUDA 12 / cuDNN 9 and matches. When the provider cannot load, onnxruntime falls
+back to CPU *silently*, so :class:`SonicOnnxPolicy` warns explicitly instead.
+
+This module imports ``torch`` at module scope on purpose: doing so loads torch's bundled CUDA
+libraries into the process, which is what lets onnxruntime's CUDA provider resolve
+``libcublasLt.so.12`` and friends without a hand-set ``LD_LIBRARY_PATH``.
 """
 
 from __future__ import annotations
@@ -152,21 +169,47 @@ class SonicOnnxPolicy:
 
         self.device = torch.device(device)
         if providers is None:
-            available = set(ort.get_available_providers())
-            providers = [
-                p
-                for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
-                if p in available
-            ] or ["CPUExecutionProvider"]
+            providers = self._default_providers(ort, self.device)
 
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self._encoder = ort.InferenceSession(str(encoder_path), options, providers=providers)
         self._decoder = ort.InferenceSession(str(decoder_path), options, providers=providers)
         self.providers = self._encoder.get_providers()
-
         self._encoder_input = self._encoder.get_inputs()[0].name
         self._decoder_input = self._decoder.get_inputs()[0].name
+
+        if self.device.type == "cuda" and "CUDAExecutionProvider" not in self.providers:
+            import warnings
+
+            warnings.warn(
+                "SONIC ONNX is running on CPU while the simulation is on CUDA. The decoder is "
+                "~37M params and costs ~17 ms per step there, against a 20 ms control period at "
+                "50 Hz. Install the GPU runtime for real-time teleoperation:\n"
+                "    uv pip install --python <isaaclab-venv>/bin/python onnxruntime-gpu",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    @staticmethod
+    def _default_providers(ort, device: torch.device) -> list:
+        """Prefer the CUDA execution provider on the simulation's own GPU.
+
+        We bind ``device_id`` to the torch device so ONNX runs on the same GPU as the simulation,
+        rather than defaulting to device 0 on a multi-GPU machine.
+
+        TensorRT is deliberately *not* selected by default: it is faster in steady state but pays a
+        multi-minute engine build on first run, which is a poor default for interactive bring-up.
+        Pass ``providers=`` explicitly to opt in.
+        """
+        available = set(ort.get_available_providers())
+        providers: list = []
+        if device.type == "cuda" and "CUDAExecutionProvider" in available:
+            providers.append(
+                ("CUDAExecutionProvider", {"device_id": device.index or 0})
+            )
+        providers.append("CPUExecutionProvider")
+        return providers
 
     def encode(self, encoder_obs: torch.Tensor) -> torch.Tensor:
         """Run the encoder.

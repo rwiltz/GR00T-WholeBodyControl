@@ -44,6 +44,16 @@ parser.add_argument("--channel", type=str, default="full_body", help="MCAP chann
 parser.add_argument("--checkpoint-dir", type=str, default=None, help="SONIC ONNX directory")
 parser.add_argument("--max-steps", type=int, default=0, help="Stop after N steps (0 = unlimited)")
 parser.add_argument("--no-loop", action="store_true", help="Stop at the end of the recording")
+parser.add_argument(
+    "--loop-mode",
+    choices=["pingpong", "wrap"],
+    default="pingpong",
+    help=(
+        "How to repeat a finite recording. 'wrap' restarts at frame 0, which teleports the "
+        "reference (in the sample clip, a 136 deg yaw jump) and makes the robot visibly snap. "
+        "'pingpong' plays forward then backward so the reference stays continuous."
+    ),
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -83,6 +93,24 @@ def _load_replay_references(path: str, channel: str) -> np.ndarray:
     return references
 
 
+def _build_playback_order(num_frames: int) -> list[int]:
+    """Frame indices to emit, one per control step, before repeating.
+
+    A finite recording has to be repeated somehow, and the naive choice teleports the reference.
+    In the sample clip the operator turns ~136 deg over 5.6 s, so restarting at frame 0 is a 136 deg
+    yaw discontinuity — 430x the median per-frame step. SONIC follows it faithfully, which reads as
+    the robot turning and then snapping back.
+
+    ``pingpong`` walks forward then backward, excluding the endpoints on the return leg so no frame
+    is emitted twice in a row. The reference stays continuous, which is what you want for a looping
+    demo capture.
+    """
+    forward = list(range(num_frames))
+    if args_cli.loop_mode == "wrap" or num_frames < 3:
+        return forward
+    return forward + list(range(num_frames - 2, 0, -1))
+
+
 def main() -> None:
     checkpoint_dir = checkpoint_dir_or_raise(args_cli.checkpoint_dir)
 
@@ -117,6 +145,10 @@ def main() -> None:
         teleop_device = IsaacTeleopDevice(env_cfg.isaac_teleop, env=env)
         print("[sonic-teleop] waiting for the headset to connect...")
 
+    playback_order = (
+        None if references is None else _build_playback_order(len(references))
+    )
+
     obs, _ = env.reset()
     step = 0
     index = 0
@@ -134,12 +166,14 @@ def main() -> None:
                     continue
                 actions = action.unsqueeze(0).to(env.device)
             else:
-                if index >= len(references):
+                if index >= len(playback_order):
                     if args_cli.no_loop:
                         break
                     index = 0
                 actions = (
-                    torch.from_numpy(references[index]).to(env.device).unsqueeze(0)
+                    torch.from_numpy(references[playback_order[index]])
+                    .to(env.device)
+                    .unsqueeze(0)
                 )
                 index += 1
 

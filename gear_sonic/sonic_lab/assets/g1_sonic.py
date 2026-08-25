@@ -87,6 +87,33 @@ def _absolutize_asset_path(cfg: ArticulationCfg) -> None:
     cfg.spawn.asset_path = str(resolved)
 
 
+def _set_ros_package_paths(cfg: ArticulationCfg) -> None:
+    """Let the URDF importer resolve ``package://robot_description/...`` mesh URIs.
+
+    ``main.urdf`` references all 49 of its visual meshes as
+    ``package://robot_description/meshes/g1/*.STL``. Resolving that scheme needs a ROS package
+    search path, and ``UrdfConverterCfg.ros_package_paths`` defaults to ``[]``.
+
+    Without this the conversion **silently succeeds** but emits zero visual geometry: the USD ends
+    up with no ``Mesh`` prims, only collision shapes tagged ``purpose = "guide"``, which are not
+    rendered. The robot then simulates correctly while being completely invisible in the viewport.
+
+    The importer expects ``ros_package_paths`` as a list of ``{"name": ..., "path": ...}`` mappings
+    (see ``urdf_usd_converter/_impl/convert.py:70-74``), not bare directory strings — passing bare
+    strings raises ``AttributeError: 'str' object has no attribute 'get'``. ``path`` is the package
+    root, so ``package://robot_description/meshes/...`` resolves to ``<path>/meshes/...``.
+    """
+    package_dir = _REPO_ROOT / "gear_sonic" / "data" / "assets" / "robot_description"
+    if not package_dir.is_dir():
+        raise FileNotFoundError(
+            f"Expected the 'robot_description' package at {package_dir}. "
+            "If this repo was cloned without Git LFS, run 'git lfs pull'."
+        )
+    cfg.spawn.ros_package_paths = [
+        {"name": package_dir.name, "path": str(package_dir)}
+    ]
+
+
 def _migrate_deprecated_actuator_limits(cfg: ArticulationCfg) -> None:
     """Move ``*_limit_sim`` onto the Isaac Lab 3.0 ``joint_*_limit`` fields.
 
@@ -119,6 +146,7 @@ def make_g1_sonic_cfg(prim_path: str = "{ENV_REGEX_NS}/Robot") -> ArticulationCf
     """
     cfg = copy.deepcopy(_UPSTREAM_CFG)
     _absolutize_asset_path(cfg)
+    _set_ros_package_paths(cfg)
     _migrate_deprecated_actuator_limits(cfg)
     return cfg.replace(prim_path=prim_path)
 
