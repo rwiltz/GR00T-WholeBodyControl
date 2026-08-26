@@ -158,10 +158,19 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         #     render_interval=4, XR    : 20.6 steps/s   20.6 renders/s
         #     render_interval=2, XR    : 16.4 steps/s   32.7 renders/s
         #
-        # Note the replay agent's reported "fps" counts *renders*, not env steps. Rendering more
-        # costs control rate, but the headset only ever sees rendered frames, so 2 is the better
-        # default for teleoperation. Revisit against a real headset: replay is not paced by OpenXR,
-        # so these ratios need not hold live.
+        # Note the replay agent's reported "fps" counts *renders*, not env steps, so a higher
+        # figure there is not by itself a speedup.
+        #
+        # The control-rate cost matters less than those numbers suggest, because Isaac Teleop does
+        # not retarget synchronously with the env step. It resolves by default to
+        # ``RetargetingExecutionConfig(mode="pipelined", pacing=DeadlinePacingConfig(...))``
+        # (``session_lifecycle.py:942``): retargeting runs on a background worker and the app
+        # consumes the most recent completed result, and XR pose prediction covers the offset. So
+        # operator input is decoupled from the env-step rate, while the headset only ever sees
+        # rendered frames -- which makes render throughput the thing worth spending on.
+        #
+        # These ratios were measured under replay, which is not paced by OpenXR, so they need not
+        # hold live.
         self.sim.render_interval = 2
         self.episode_length_s = 120.0
 
