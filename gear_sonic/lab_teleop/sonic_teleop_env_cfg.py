@@ -146,7 +146,23 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         # 200 Hz physics / 50 Hz control == SONIC's control_dt_ of 0.02.
         self.decimation = 4
         self.sim.dt = 1.0 / 200.0
-        self.sim.render_interval = self.decimation
+        # 100 Hz rendering (2 renders per 50 Hz control step), matching
+        # contrib/locomanip_pick_place. Isaac Lab logs a warning that render_interval < decimation
+        # causes multiple renders per step; that is intended here.
+        #
+        # This trades control rate for render throughput. Measured on this machine replaying a
+        # capture (env steps/s vs renders/s):
+        #
+        #     render_interval=4, no XR : 31.8 steps/s   33.8 renders/s
+        #     render_interval=2, no XR : 22.3 steps/s   47.1 renders/s
+        #     render_interval=4, XR    : 20.6 steps/s   20.6 renders/s
+        #     render_interval=2, XR    : 16.4 steps/s   32.7 renders/s
+        #
+        # Note the replay agent's reported "fps" counts *renders*, not env steps. Rendering more
+        # costs control rate, but the headset only ever sees rendered frames, so 2 is the better
+        # default for teleoperation. Revisit against a real headset: replay is not paced by OpenXR,
+        # so these ratios need not hold live.
+        self.sim.render_interval = 2
         self.episode_length_s = 120.0
 
         self.viewer.eye = (2.4, 2.4, 1.6)
