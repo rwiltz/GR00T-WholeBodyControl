@@ -34,11 +34,29 @@ lower body to a kinematic planner.
 
 ## Prerequisites
 
-1. **Isaac Lab 3.0** (`3.0.0-beta2` or newer). Installed separately — see the
-   [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-   A **source checkout** is required, because the stock teleoperation scripts live under
-   `scripts/` and are not shipped in the wheel.
-2. **This repo**, installed into Isaac Lab's Python environment:
+1. **Isaac Lab 3.0** (`3.0.0-beta2` or newer), as a **source checkout** — the stock teleoperation
+   scripts live under `scripts/` and are not shipped in the wheel, so a wheel-only install is not
+   enough.
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   git clone https://github.com/isaac-sim/IsaacLab.git
+   cd IsaacLab
+   uv run isaaclab --help     # first run creates .venv and installs dependencies
+   ```
+
+   This creates `IsaacLab/.venv`, which is the environment every command below runs in. Either
+   activate it, or target it explicitly:
+
+   ```bash
+   source /path/to/IsaacLab/.venv/bin/activate
+   # or prefix each install with:  uv pip install --python /path/to/IsaacLab/.venv/bin/python ...
+   ```
+
+   See the [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html)
+   for alternatives and troubleshooting.
+2. **This repo**, installed into that same Isaac Lab environment (from the
+   `GR00T-WholeBodyControl` root):
 
    ```bash
    pip install --no-deps -e ./gear_sonic
