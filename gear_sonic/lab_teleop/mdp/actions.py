@@ -152,6 +152,40 @@ class SonicWholeBodyAction(ActionTerm):
         )
         self._processed_actions = torch.zeros_like(self._raw_actions)
 
+        self._warn_if_xr_anchor_missing(env)
+
+    @staticmethod
+    def _warn_if_xr_anchor_missing(env: ManagerBasedEnv) -> None:
+        """Warn when the configured XR anchor prim does not exist.
+
+        A bad ``anchor_prim_path`` does not raise: the XR session falls back to the world origin, so
+        the operator's frame silently stops riding with the robot. That is hard to attribute from
+        inside a headset, so check it once at setup instead.
+        """
+        xr_cfg = getattr(env.cfg, "xr", None)
+        prim_path = getattr(xr_cfg, "anchor_prim_path", None)
+        if not prim_path:
+            return
+        try:
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+        except Exception:  # noqa: BLE001 - no stage outside Isaac Sim; nothing to check
+            return
+        if stage is None or stage.GetPrimAtPath(prim_path).IsValid():
+            return
+
+        import warnings
+
+        warnings.warn(
+            f"XR anchor prim {prim_path!r} does not exist; the anchor will fall back to the world "
+            "origin and will not follow the robot. Note Isaac Lab's URDF importer nests links "
+            "under a 'Geometry' scope, so the path is e.g. "
+            "'/World/envs/env_0/Robot/Geometry/pelvis', not '/World/envs/env_0/Robot/pelvis'.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     @property
     def action_dim(self) -> int:
         """Width of the SONIC reference frame produced by the retargeter."""

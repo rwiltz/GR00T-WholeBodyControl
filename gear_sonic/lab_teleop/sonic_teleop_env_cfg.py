@@ -41,7 +41,32 @@ from gear_sonic.lab_teleop.assets import (
 )
 from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
 
-__all__ = ["DEFAULT_CHECKPOINT_DIR", "SonicTeleopG1EnvCfg"]
+__all__ = [
+    "ANCHOR_ROT_YAW_RIGHT_90",
+    "DEFAULT_CHECKPOINT_DIR",
+    "SONIC_G1_PELVIS_PRIM",
+    "SonicTeleopG1EnvCfg",
+]
+
+#: XR anchor yaw, as an XYZW quaternion: -90 deg about +Z, i.e. rotated 90 deg to the right.
+#:
+#: ``XrCfg.anchor_rot`` is **XYZW**, not WXYZ -- ``xr_anchor_manager.py:105`` unpacks it as
+#: ``x, y, z, w``. Flip the sign of the Z term for 90 deg to the left.
+_SQRT_HALF = 0.7071067811865476
+ANCHOR_ROT_YAW_RIGHT_90 = (0.0, 0.0, -_SQRT_HALF, _SQRT_HALF)
+
+#: Prim path of the G1 pelvis, used as the XR anchor.
+#:
+#: Note the ``Geometry/`` segment. Isaac Lab's URDF importer nests links hierarchically under a
+#: ``Geometry`` scope keyed by the URDF root link, whereas the shipped G1 USD that
+#: ``locomanip_pick_place`` anchors against exposes links flat under the articulation root. Copying
+#: that config's ``.../Robot/pelvis`` therefore points at a prim that does not exist here, and the
+#: anchor **silently falls back to the world origin** rather than erroring -- the operator's frame
+#: simply stops riding with the robot.
+#:
+#: This prim carries ``PhysicsRigidBodyAPI`` and ``PhysicsArticulationRootAPI``, i.e. it is the
+#: physics body itself; ``Robot/Physics/`` holds only the joints.
+SONIC_G1_PELVIS_PRIM = "/World/envs/env_0/Robot/Geometry/pelvis"
 
 #: Where ``download_from_hf.py --sonic-v1-1`` puts the deployment ONNX graphs.
 DEFAULT_CHECKPOINT_DIR = str(
@@ -148,8 +173,8 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         # FOLLOW_PRIM_SMOOTHED tracks the pelvis with smoothing so per-step base jitter is not fed
         # back into the headset view, and `fixed_anchor_height` holds the anchor at a constant
         # height so vertical bob during locomotion does not translate into camera motion.
-        self.xr = XrCfg(anchor_pos=(0.0, 0.0, -0.95), anchor_rot=(0.0, 0.0, 0.0, 1.0))
-        self.xr.anchor_prim_path = "/World/envs/env_0/Robot/pelvis"
+        self.xr = XrCfg(anchor_pos=(0.0, 0.0, -0.95), anchor_rot=ANCHOR_ROT_YAW_RIGHT_90)
+        self.xr.anchor_prim_path = SONIC_G1_PELVIS_PRIM
         self.xr.fixed_anchor_height = True
         self.xr.anchor_rotation_mode = XrAnchorRotationMode.FOLLOW_PRIM_SMOOTHED
 
