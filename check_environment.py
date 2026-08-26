@@ -169,7 +169,7 @@ def check_lab_teleop_deps():
             check(
                 "onnxruntime-gpu",
                 False,
-                msg_fail='not installed (pip install -e "gear_sonic/[lab_teleop]")',
+                msg_fail="not installed (see docs/source/tutorials/isaaclab_teleop.md)",
             )
         )
         return all(results)
@@ -187,8 +187,9 @@ def check_lab_teleop_deps():
                 False,
                 msg_fail=(
                     f"unavailable (found {providers}); SONIC would fall back to CPU. "
-                    f"Install an onnxruntime-gpu built for CUDA {torch_cuda or '12'}, "
-                    "e.g. onnxruntime-gpu==1.22.0 for CUDA 12"
+                    f"torch is built for CUDA {torch_cuda or '?'}; install a matching runtime:\n"
+                    "        CUDA 12.x: pip install 'onnxruntime-gpu[cuda,cudnn]>=1.20,<1.27'\n"
+                    "        CUDA 13.x: pip install 'onnxruntime-gpu[cuda,cudnn]>=1.27,<1.30'"
                 ),
             )
         )

@@ -90,21 +90,23 @@ inference = [
     "scipy",
     "Isaac-GR00T @ git+https://github.com/NVIDIA/Isaac-GR00T.git",
 ]
-# Isaac Lab teleoperation + data collection (Isaac Lab must be installed separately).
-# Shares Isaac Lab's Python environment with [training]; no separate venv is created.
+# NOTE: there is deliberately no extra for the Isaac Lab teleoperation workflow.
 #
-# onnxruntime-gpu runs the SONIC encoder/decoder. The version must match the CUDA major version
-# of the torch build in the Isaac Lab environment: the 1.22 line targets CUDA 12 / cuDNN 9, while
-# 1.28 links CUDA 13 and fails to load against torch 2.x+cu12x with
-# "libcublasLt.so.13: cannot open shared object file". When the provider cannot load, onnxruntime
-# silently falls back to CPU, where the decoder costs ~17 ms against a 20 ms control period.
-# NOTE: install this extra with --no-deps. gear_sonic pins numpy==1.26.4 / scipy==1.15.3,
-# and resolving those against an Isaac Lab 3.0 environment downgrades its numpy 2.x,
-# which can break Isaac Sim. See docs/source/tutorials/isaaclab_teleop.md.
-# Usage: pip install --no-deps -e ./gear_sonic && pip install onnxruntime-gpu==1.22.0
-lab_teleop = [
-    "onnxruntime-gpu==1.22.0",
-]
+# An extra would have to be resolved together with the base dependencies above, and the
+# numpy==1.26.4 / scipy==1.15.3 pins downgrade Isaac Lab 3.0's numpy 2.x, which can break Isaac Sim.
+# That workflow therefore installs this package with --no-deps and adds its one runtime dependency,
+# onnxruntime-gpu, directly:
+#
+#     pip install --no-deps -e ./gear_sonic
+#     pip install "onnxruntime-gpu[cuda,cudnn]>=1.20,<1.27"   # if torch.version.cuda is 12.x
+#     pip install "onnxruntime-gpu[cuda,cudnn]>=1.27,<1.30"   # if torch.version.cuda is 13.x
+#
+# The onnxruntime-gpu version tracks the CUDA major version of the torch build in the target
+# environment, not the host CUDA toolkit or Linux distribution: both torch and onnxruntime take
+# their CUDA runtime from pip wheels. This cannot be expressed as a static pin, since PEP 508
+# markers cannot key on a dependency's CUDA build. See
+# docs/source/tutorials/isaaclab_teleop.md and
+# https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html
 # Training: full RL training stack (Isaac Lab must be installed separately)
 # Usage: pip install -e "gear_sonic[training]"
 training = [

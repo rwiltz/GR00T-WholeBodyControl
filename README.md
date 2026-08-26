@@ -365,7 +365,7 @@ python check_environment.py
 | I want to... | Environment | How to install |
 |---|---|---|
 | **Train / finetune SONIC** | Isaac Lab's Python env | [Install Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html), then `pip install -e "gear_sonic/[training]"` |
-| **Teleoperate SONIC in Isaac Lab (sim)** | Isaac Lab's Python env | [Install Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html), then `pip install --no-deps -e ./gear_sonic && pip install onnxruntime-gpu==1.22.0` — see the [tutorial](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaaclab_teleop.html) |
+| **Teleoperate SONIC in Isaac Lab (sim)** | Isaac Lab's Python env | [Install Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html), then `pip install --no-deps -e ./gear_sonic` plus a CUDA-matched `onnxruntime-gpu` — see the [tutorial](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaaclab_teleop.html) |
 | **Run MuJoCo simulation** | `.venv_sim` (auto-created) | `bash install_scripts/install_mujoco_sim.sh` |
 | **VR teleoperation** | `.venv_teleop` (auto-created) | `bash install_scripts/install_pico.sh` |
 | **Collect data** | `.venv_data_collection` (auto-created) | `bash install_scripts/install_data_collection.sh` |

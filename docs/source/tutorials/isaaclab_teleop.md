@@ -38,43 +38,59 @@ lower body to a kinematic planner.
    [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
    A **source checkout** is required, because the stock teleoperation scripts live under
    `scripts/` and are not shipped in the wheel.
-2. **This repo and the ONNX GPU runtime**, in Isaac Lab's Python environment:
+2. **This repo**, installed into Isaac Lab's Python environment:
 
    ```bash
    pip install --no-deps -e ./gear_sonic
-   pip install onnxruntime-gpu==1.22.0
    ```
 
    ```{admonition} Install with --no-deps
    :class: warning
-   `gear_sonic` pins `numpy==1.26.4` and `scipy==1.15.3`. Isaac Lab 3.0 ships numpy 2.x, so a plain
-   `pip install -e "gear_sonic/[lab_teleop]"` **downgrades numpy and scipy in Isaac Lab's
-   environment**, which can break Isaac Sim. This workflow only uses `gear_sonic`'s pure rotation
-   and SMPL forward-kinematics helpers, which run correctly on numpy 2.x, so install without
-   dependencies and add the one runtime dependency explicitly.
+   `gear_sonic` pins `numpy==1.26.4` and `scipy==1.15.3` for Isaac Lab 2.3.2. Isaac Lab 3.0 ships
+   numpy 2.x, so resolving those pins **downgrades numpy and scipy in Isaac Lab's environment**,
+   which can break Isaac Sim. This workflow uses only `gear_sonic`'s pure rotation and SMPL
+   forward-kinematics helpers, which run correctly on numpy 2.x. For the same reason this workflow
+   has no `pip` extra — an extra would be resolved against those pins.
    ```
 
-3. **SONIC checkpoints**:
+3. **The ONNX GPU runtime.** Pick the line matching the CUDA major version of the torch build in
+   this environment:
+
+   ```bash
+   python -c "import torch; print(torch.version.cuda)"
+   ```
+
+   | `torch.version.cuda` | install |
+   |---|---|
+   | `12.x` | `pip install "onnxruntime-gpu[cuda,cudnn]>=1.20,<1.27"` |
+   | `13.x` | `pip install "onnxruntime-gpu[cuda,cudnn]>=1.27,<1.30"` |
+
+   What matters is torch's CUDA build, **not** the host CUDA toolkit or Linux distribution: torch
+   and onnxruntime both take their CUDA runtime from pip wheels. The `[cuda,cudnn]` extras pull
+   those wheels explicitly, so nothing depends on a system CUDA install — and in an Isaac Lab
+   environment they are usually already satisfied by torch, making them a no-op.
+
+   Getting this wrong is quiet rather than loud. `onnxruntime-gpu` 1.28 against a `cu12` torch fails
+   with `libcublasLt.so.13: cannot open shared object file`, and onnxruntime then falls back to CPU
+   **silently** — where the SONIC decoder costs ~17 ms against a 20 ms control period. Verify with
+   `check_environment.py --lab-teleop` (below) rather than inferring from frame rate.
+
+4. **SONIC checkpoints**:
 
    ```bash
    python download_from_hf.py --sonic-v1-1
    ```
 
-4. **Git LFS**, for the G1 meshes: `git lfs pull`.
+5. **Git LFS**, for the G1 meshes: `git lfs pull`.
 
-### Verify the GPU runtime
-
-The SONIC decoder is ~37M parameters. On CPU it costs ~17 ms per step against a 20 ms control
-period at 50 Hz, so the environment cannot reach real time; on CUDA it is ~0.7 ms.
+### Verify
 
 ```bash
-python -c "import torch, onnxruntime as ort; print(ort.get_available_providers())"
+python check_environment.py --lab-teleop
 ```
 
-`CUDAExecutionProvider` must be listed. If it is missing, the `onnxruntime-gpu` build does not match
-your torch CUDA major version — see the comment on the `lab_teleop` extra in
-`gear_sonic/pyproject.toml`. onnxruntime falls back to CPU **silently**, so this is worth checking
-rather than inferring from frame rate.
+Checks Isaac Lab, `isaacteleop`, `gear_sonic`, the SONIC checkpoint, and that the CUDA execution
+provider actually loads.
 
 ## Tasks
 
@@ -162,6 +178,25 @@ Measured on a Threadripper 7960X / RTX PRO 6000, single environment:
 
 The control rate is 50 Hz (200 Hz physics, `decimation = 4`), matching SONIC's own `control_dt`.
 The gap between headless and windowed is rendering, not inference.
+
+### Why onnxruntime
+
+SONIC is run through the released ONNX graphs, so simulation executes the same weights and graph as
+the robot. The alternatives were considered:
+
+- **TensorRT** is what the C++ deploy stack uses on the robot, and onnxruntime can reach it via
+  `TensorrtExecutionProvider`. It is not the default here: it requires additional NVIDIA packages
+  beyond `onnxruntime-gpu`, and pays a multi-minute engine build on first run unless engine caching
+  is configured. Pass `providers=` to `SonicOnnxPolicy` to opt in.
+- **PyTorch** would avoid the CUDA-matching step entirely, since Isaac Lab's torch is already
+  correct by construction — this is how `eval_agent_trl.py` runs SONIC during training. It needs the
+  `.pt` checkpoint plus the training dependency stack (hydra, trl, transformers), which is a much
+  heavier install for a workflow that otherwise needs none of it.
+- **Warp** is not applicable. It is a GPU kernel-authoring framework, not an inference runtime: it
+  has no ONNX ingestion and no neural-network layers, so the model would have to be reimplemented by
+  hand. It ships with Isaac Lab, but that does not make it a fit.
+
+One consequence of the ONNX path: the released graphs are exported with a fixed batch size of 1.
 
 ## Known characteristics
 
