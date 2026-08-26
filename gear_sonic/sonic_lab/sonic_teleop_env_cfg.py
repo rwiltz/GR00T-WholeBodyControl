@@ -127,6 +127,60 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.eye = (2.4, 2.4, 1.6)
         self.viewer.lookat = (0.0, 0.0, 0.8)
 
+        # Attaching the teleop pipeline to the cfg is what lets the stock Isaac Lab entry points
+        # drive this environment. `teleop_se3_agent.py:277-279` selects the Isaac Teleop path with
+        #     use_isaac_teleop = not <--teleop_device given> and env_cfg.isaac_teleop is not None
+        # and its main loop is device-agnostic: it passes whatever `IsaacTeleopDevice.advance()`
+        # returns straight to `env.step()`. Our pipeline's "action" output is the 83-wide SONIC
+        # reference, which is exactly what the action term consumes.
+        #
+        # Note the SE(3) devices (`--teleop_device keyboard|spacemouse|gamepad`) can NOT drive this
+        # env: they emit a 6-DoF delta plus gripper, which cannot express a whole-body pose.
+        from isaaclab_teleop import IsaacTeleopCfg, XrAnchorRotationMode, XrCfg
+
+        from gear_sonic.sonic_lab.retargeters import build_sonic_fullbody_pipeline
+
+        # Anchor the operator's XR frame to the robot's pelvis, matching
+        # `isaaclab_tasks.contrib.locomanip_pick_place`. For a mobile humanoid this is what keeps
+        # the operator's frame riding with the robot instead of pinned to world origin: the robot
+        # walks and turns under SONIC, and the operator's reference frame follows it.
+        #
+        # FOLLOW_PRIM_SMOOTHED tracks the pelvis with smoothing so per-step base jitter is not fed
+        # back into the headset view, and `fixed_anchor_height` holds the anchor at a constant
+        # height so vertical bob during locomotion does not translate into camera motion.
+        self.xr = XrCfg(anchor_pos=(0.0, 0.0, -0.95), anchor_rot=(0.0, 0.0, 0.0, 1.0))
+        self.xr.anchor_prim_path = "/World/envs/env_0/Robot/pelvis"
+        self.xr.fixed_anchor_height = True
+        self.xr.anchor_rotation_mode = XrAnchorRotationMode.FOLLOW_PRIM_SMOOTHED
+
+        self.isaac_teleop = IsaacTeleopCfg(
+            pipeline_builder=build_sonic_fullbody_pipeline,
+            sim_device=self.sim.device,
+            xr_cfg=self.xr,
+        )
+
+
+@configclass
+class SonicTeleopG1ReplayEnvCfg(SonicTeleopG1EnvCfg):
+    """Same environment, wired for MCAP replay instead of a live headset.
+
+    ``TeleopSession`` rejects source nodes that carry a tracker vendor when the session mode is
+    ``SessionMode.REPLAY`` (``teleop_session.py:313-333``): replay reads whatever channel was
+    recorded regardless of vendor, so a vendor selection would be silently ignored and it fails
+    fast instead. This variant therefore swaps in the vendor-less pipeline builder.
+
+    Use with ``scripts/environments/teleoperation/teleop_replay_agent.py --replay_file <mcap>``.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.sonic_lab.retargeters import (
+            build_sonic_fullbody_replay_pipeline,
+        )
+
+        self.isaac_teleop.pipeline_builder = build_sonic_fullbody_replay_pipeline
+
 
 def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:
     """Return a validated SONIC checkpoint directory.

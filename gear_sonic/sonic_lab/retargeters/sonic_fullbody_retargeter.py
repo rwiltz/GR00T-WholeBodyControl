@@ -44,6 +44,7 @@ operator proportions are replaced wholesale by the canonical body. We preserve t
 from __future__ import annotations
 
 from dataclasses import dataclass
+import pathlib
 
 import numpy as np
 from scipy.spatial.transform import Rotation as sRot
@@ -59,6 +60,7 @@ from isaacteleop.retargeting_engine.interface.tensor_group_type import (
 from isaacteleop.retargeting_engine.tensor_types import (
     DLDataType,
     FullBodyInput,
+    FullBodyInputIndex,
     NDArrayType,
 )
 
@@ -101,6 +103,18 @@ _G1_WRIST_INDICES = (23, 24, 25, 26, 27, 28)
 
 #: G1 elbow hinge axis; used for the swing/twist split.
 _G1_ELBOW_AXIS = np.array([0.0, 1.0, 0.0])
+
+#: Canonical SMPL rest skeleton driving the FK. ``compute_human_joints`` defaults this to the
+#: *relative* path ``gear_sonic/data/human/human_joints_info.pkl``, which only resolves when the
+#: process cwd happens to be the repo root — running from an Isaac Lab checkout fails with
+#: ``FileNotFoundError``, and the teleop session reports it as an XR teardown. Resolve it here.
+_HUMAN_JOINTS_INFO_PATH = str(
+    pathlib.Path(__file__).resolve().parents[3]
+    / "gear_sonic"
+    / "data"
+    / "human"
+    / "human_joints_info.pkl"
+)
 
 #: Flat output width: 1 valid flag + 24*3 joints + 4 root quat + 6 wrist angles.
 SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6
@@ -181,9 +195,12 @@ class SonicFullBodyRetargeter(BaseRetargeter):
             outputs["sonic_reference"][0] = self._fallback_frame()
             return
 
-        positions = np.asarray(body[0]["body_joint_positions"], dtype=np.float32)
-        orientations = np.asarray(body[0]["body_joint_orientations"], dtype=np.float32)
-        valid = np.asarray(body[0]["body_joint_valid"], dtype=np.uint8)
+        # Tensor groups are indexed by their generated index enum and exported via DLPack, not by
+        # field name. Indexing with a string raises "only integers, slices ... are valid indices",
+        # which the teleop session swallows and reports as an XR teardown.
+        positions = np.from_dlpack(body[FullBodyInputIndex.JOINT_POSITIONS])
+        orientations = np.from_dlpack(body[FullBodyInputIndex.JOINT_ORIENTATIONS])
+        valid = np.from_dlpack(body[FullBodyInputIndex.JOINT_VALID])
 
         # Upstream requires every body joint; a partially-tracked skeleton would silently produce a
         # plausible-but-wrong pose, which is worse than holding the last good frame.
@@ -192,7 +209,10 @@ class SonicFullBodyRetargeter(BaseRetargeter):
             return
 
         # (24, 7) == [x, y, z, qx, qy, qz, qw], matching upstream's body_poses_np layout.
-        body_poses = np.concatenate([positions, orientations], axis=1)
+        body_poses = np.concatenate(
+            [np.asarray(positions, dtype=np.float32), np.asarray(orientations, dtype=np.float32)],
+            axis=1,
+        )
         frame = self._retarget(body_poses)
 
         self._last_good = frame
@@ -280,6 +300,7 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         joints = compute_human_joints(
             body_pose=body_pose[..., :63],
             global_orient=global_orient_new,
+            human_joints_info_path=_HUMAN_JOINTS_INFO_PATH,
         )
 
         global_orient_quat = remove_smpl_base_rot(global_orient_quat, w_last=False)
