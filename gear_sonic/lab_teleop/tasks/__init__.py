@@ -11,7 +11,7 @@ task by name via ``parse_env_cfg`` + ``gym.make``::
     scripts/environments/teleoperation/teleop_replay_agent.py  --task <id> --replay_file <mcap>
     scripts/tools/record_demos.py                              --task <id>
 
-Import this module (or :mod:`gear_sonic.sonic_lab`) before calling ``gym.make``.
+Import this module (or :mod:`gear_sonic.lab_teleop`) before calling ``gym.make``.
 
 Naming: the id deliberately avoids the substrings ``Lift`` and ``Reach``. ``teleop_se3_agent.py``
 pattern-matches on the task name (``if "Lift" in args_cli.task``, ``if "Reach" in ...``) and injects
@@ -33,7 +33,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": (
-            "gear_sonic.sonic_lab.sonic_teleop_env_cfg:SonicTeleopG1EnvCfg"
+            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1EnvCfg"
         ),
     },
     disable_env_checker=True,
@@ -44,7 +44,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": (
-            "gear_sonic.sonic_lab.sonic_teleop_env_cfg:SonicTeleopG1ReplayEnvCfg"
+            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1ReplayEnvCfg"
         ),
     },
     disable_env_checker=True,

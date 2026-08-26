@@ -5,7 +5,7 @@
 """Minimal Isaac Lab environment for SONIC whole-body teleoperation of the G1.
 
 A deliberately small manager-based environment whose only action term is
-:class:`~gear_sonic.sonic_lab.mdp.actions.SonicWholeBodyAction`. The point is to exercise the
+:class:`~gear_sonic.lab_teleop.mdp.actions.SonicWholeBodyAction`. The point is to exercise the
 full chain — Isaac Teleop full-body tracking -> retargeter -> SONIC -> G1 joint targets — without
 dragging in task-specific scene objects, rewards or curricula.
 
@@ -13,8 +13,8 @@ Timing matches both SONIC and the reference locomanip environment: ``sim.dt = 1/
 ``decimation = 4`` gives a 50 Hz control rate, which is exactly SONIC's ``control_dt_ = 0.02``.
 
 Attach teleop by pointing ``IsaacTeleopCfg.pipeline_builder`` at
-:func:`~gear_sonic.sonic_lab.retargeters.pipeline.build_sonic_fullbody_pipeline` for a live
-headset, or :func:`~gear_sonic.sonic_lab.retargeters.pipeline.build_sonic_fullbody_replay_pipeline`
+:func:`~gear_sonic.lab_teleop.retargeters.pipeline.build_sonic_fullbody_pipeline` for a live
+headset, or :func:`~gear_sonic.lab_teleop.retargeters.pipeline.build_sonic_fullbody_replay_pipeline`
 together with ``SessionMode.REPLAY`` to drive it from a recorded MCAP.
 """
 
@@ -34,12 +34,12 @@ from isaaclab.assets import AssetBaseCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.utils.configclass import configclass
 
-from gear_sonic.sonic_lab.assets import (
+from gear_sonic.lab_teleop.assets import (
     G1_MODEL_12_ACTION_SCALE,
     make_g1_sonic_cfg,
     repo_root,
 )
-from gear_sonic.sonic_lab.mdp.actions import SonicWholeBodyActionCfg
+from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
 
 __all__ = ["DEFAULT_CHECKPOINT_DIR", "SonicTeleopG1EnvCfg"]
 
@@ -138,7 +138,7 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         # env: they emit a 6-DoF delta plus gripper, which cannot express a whole-body pose.
         from isaaclab_teleop import IsaacTeleopCfg, XrAnchorRotationMode, XrCfg
 
-        from gear_sonic.sonic_lab.retargeters import build_sonic_fullbody_pipeline
+        from gear_sonic.lab_teleop.retargeters import build_sonic_fullbody_pipeline
 
         # Anchor the operator's XR frame to the robot's pelvis, matching
         # `isaaclab_tasks.contrib.locomanip_pick_place`. For a mobile humanoid this is what keeps
@@ -175,7 +175,7 @@ class SonicTeleopG1ReplayEnvCfg(SonicTeleopG1EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        from gear_sonic.sonic_lab.retargeters import (
+        from gear_sonic.lab_teleop.retargeters import (
             build_sonic_fullbody_replay_pipeline,
         )
 

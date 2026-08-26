@@ -12,7 +12,7 @@ raw joint targets.
 Action contract
 ---------------
 The action passed to ``env.step()`` is the 83-wide SONIC reference frame emitted by
-:class:`~gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter.SonicFullBodyRetargeter`.
+:class:`~gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter.SonicFullBodyRetargeter`.
 Per control step this term:
 
 1. pushes the reference into a 10-frame rolling window,
@@ -42,16 +42,16 @@ from isaaclab.assets.articulation import Articulation
 from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
 from isaaclab.utils.configclass import configclass
 
-from gear_sonic.sonic_lab.mdp.proprio_history import (
+from gear_sonic.lab_teleop.mdp.proprio_history import (
     SONIC_HISTORY_LENGTH,
     SonicProprioHistory,
 )
-from gear_sonic.sonic_lab.mdp.sonic_policy import (
+from gear_sonic.lab_teleop.mdp.sonic_policy import (
     SONIC_NUM_ACTIONS,
     SonicOnnxPolicy,
     smpl_anchor_orientation_heading,
 )
-from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,
     SonicReferenceSlice,
 )
@@ -87,7 +87,7 @@ class SonicWholeBodyActionCfg(ActionTermCfg):
     # Resolved lazily from this entry point so the cfg can be declared before the class, matching
     # the pattern used by isaaclab_tasks.contrib.locomanip_pick_place.
     class_type: type["SonicWholeBodyAction"] | str = (
-        "gear_sonic.sonic_lab.mdp.actions:SonicWholeBodyAction"
+        "gear_sonic.lab_teleop.mdp.actions:SonicWholeBodyAction"
     )
 
     checkpoint_dir: str = MISSING

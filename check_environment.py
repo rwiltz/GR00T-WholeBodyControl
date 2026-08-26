@@ -141,6 +141,78 @@ def check_training_deps():
     return all(results)
 
 
+def check_lab_teleop_deps():
+    """Isaac Lab teleoperation workflow: Isaac Teleop plus a working ONNX GPU provider."""
+    results = []
+
+    try:
+        import isaacteleop  # noqa: F401
+
+        version = getattr(isaacteleop, "__version__", "ok")
+        results.append(check("isaacteleop", True, msg_pass=version))
+    except ImportError:
+        results.append(
+            check(
+                "isaacteleop",
+                False,
+                msg_fail="not installed (comes with Isaac Lab; see the Isaac Lab install guide)",
+            )
+        )
+
+    # Importing torch first loads its bundled CUDA libraries, which is what lets onnxruntime's
+    # CUDA provider resolve libcublasLt/cudnn without a hand-set LD_LIBRARY_PATH.
+    try:
+        import torch  # noqa: F401
+        import onnxruntime as ort
+    except ImportError:
+        results.append(
+            check(
+                "onnxruntime-gpu",
+                False,
+                msg_fail='not installed (pip install -e "gear_sonic/[lab_teleop]")',
+            )
+        )
+        return all(results)
+
+    providers = ort.get_available_providers()
+    if "CUDAExecutionProvider" in providers:
+        results.append(check("onnxruntime CUDA provider", True, msg_pass=ort.__version__))
+    else:
+        # onnxruntime falls back to CPU silently. The SONIC decoder costs ~17 ms there against a
+        # 20 ms control period, so the environment cannot reach its 50 Hz control rate.
+        torch_cuda = getattr(__import__("torch").version, "cuda", None)
+        results.append(
+            check(
+                "onnxruntime CUDA provider",
+                False,
+                msg_fail=(
+                    f"unavailable (found {providers}); SONIC would fall back to CPU. "
+                    f"Install an onnxruntime-gpu built for CUDA {torch_cuda or '12'}, "
+                    "e.g. onnxruntime-gpu==1.22.0 for CUDA 12"
+                ),
+            )
+        )
+    return all(results)
+
+
+def check_sonic_checkpoint():
+    """The SONIC ONNX graphs the Isaac Lab action term loads."""
+    # Anchor to this script's directory, not the cwd, so the check works from anywhere.
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    ckpt = os.path.join(repo_root, "gear_sonic_deploy", "policy", "sonic_v1_1")
+    missing = [
+        name
+        for name in ("model_encoder.onnx", "model_decoder.onnx")
+        if not os.path.isfile(os.path.join(ckpt, name))
+    ]
+    return check(
+        "SONIC checkpoint",
+        not missing,
+        msg_pass=ckpt,
+        msg_fail=f"missing {missing} in {ckpt} (python download_from_hf.py --sonic-v1-1)",
+    )
+
+
 def check_tensorrt():
     trt_root = os.environ.get("TensorRT_ROOT", "")
     if not trt_root:
@@ -185,6 +257,8 @@ def main():
         mode = "training"
     elif "--deploy" in sys.argv:
         mode = "deploy"
+    elif "--lab-teleop" in sys.argv:
+        mode = "lab_teleop"
 
     print(f"GR00T-WholeBodyControl Environment Check")
     print(f"Platform: {platform.system()} {platform.machine()}")
@@ -207,6 +281,14 @@ def main():
         all_pass &= check_isaaclab()
         all_pass &= check_gear_sonic()
         all_pass &= check_training_deps()
+        print()
+
+    if mode in ("all", "lab_teleop"):
+        print("Isaac Lab teleoperation:")
+        all_pass &= check_isaaclab()
+        all_pass &= check_gear_sonic()
+        all_pass &= check_lab_teleop_deps()
+        all_pass &= check_sonic_checkpoint()
         print()
 
     if mode in ("all", "deploy"):

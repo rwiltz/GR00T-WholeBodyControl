@@ -365,6 +365,7 @@ python check_environment.py
 | I want to... | Environment | How to install |
 |---|---|---|
 | **Train / finetune SONIC** | Isaac Lab's Python env | [Install Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html), then `pip install -e "gear_sonic/[training]"` |
+| **Teleoperate SONIC in Isaac Lab (sim)** | Isaac Lab's Python env | [Install Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html), then `pip install --no-deps -e ./gear_sonic && pip install onnxruntime-gpu==1.22.0` — see the [tutorial](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaaclab_teleop.html) |
 | **Run MuJoCo simulation** | `.venv_sim` (auto-created) | `bash install_scripts/install_mujoco_sim.sh` |
 | **VR teleoperation** | `.venv_teleop` (auto-created) | `bash install_scripts/install_pico.sh` |
 | **Collect data** | `.venv_data_collection` (auto-created) | `bash install_scripts/install_data_collection.sh` |
@@ -388,6 +389,7 @@ Training is the only one that requires Isaac Lab (installed separately).
 - [Gamepad Control](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/gamepad.html)
 - [ZMQ Communication](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/zmq.html)
 - [ZMQ Manager / PICO VR](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vr_wholebody_teleop.html)
+- [Isaac Lab Teleoperation & Data Collection](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/isaaclab_teleop.html)
 
 ### Training
 - [Installation (Training)](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_training.html)

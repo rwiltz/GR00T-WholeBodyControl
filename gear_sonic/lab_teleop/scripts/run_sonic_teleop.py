@@ -17,11 +17,11 @@ Two input sources:
 Examples::
 
     # replay, with a viewport
-    python -m gear_sonic.sonic_lab.scripts.run_sonic_teleop \\
+    python -m gear_sonic.lab_teleop.scripts.run_sonic_teleop \\
         --mcap ~/recordings/full_body_*.mcap --viz kit
 
     # live headset
-    python -m gear_sonic.sonic_lab.scripts.run_sonic_teleop --live --viz kit
+    python -m gear_sonic.lab_teleop.scripts.run_sonic_teleop --live --viz kit
 
 .. warning::
    ONNX inference falls back to CPU unless ``onnxruntime-gpu`` is installed, and the SONIC decoder
@@ -68,11 +68,11 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
-from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
 )
-from gear_sonic.sonic_lab.sonic_teleop_env_cfg import (
+from gear_sonic.lab_teleop.sonic_teleop_env_cfg import (
     SonicTeleopG1EnvCfg,
     checkpoint_dir_or_raise,
 )
@@ -80,7 +80,7 @@ from gear_sonic.sonic_lab.sonic_teleop_env_cfg import (
 
 def _load_replay_references(path: str, channel: str) -> np.ndarray:
     """Replay an MCAP and retarget every frame up front."""
-    from gear_sonic.sonic_lab.tests.replay_mcap import read_body_frames
+    from gear_sonic.lab_teleop.tests.replay_mcap import read_body_frames
 
     frames = read_body_frames(path, channel)
     if not frames:
@@ -123,7 +123,7 @@ def main() -> None:
     if args_cli.live:
         from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
-        from gear_sonic.sonic_lab.retargeters import build_sonic_fullbody_pipeline
+        from gear_sonic.lab_teleop.retargeters import build_sonic_fullbody_pipeline
 
         env_cfg.xr = XrCfg(anchor_pos=(0.0, 0.0, 0.0), anchor_rot=(1.0, 0.0, 0.0, 0.0))
         env_cfg.isaac_teleop = IsaacTeleopCfg(

@@ -55,7 +55,7 @@ __all__ = [
     "repo_root",
 ]
 
-# gear_sonic/sonic_lab/assets/g1_sonic.py -> repo root is 4 levels up.
+# gear_sonic/lab_teleop/assets/g1_sonic.py -> repo root is 4 levels up.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 #: SONIC's G1 is 29 DoF (no hand joints in ``robot_description/urdf/g1/main.urdf``).

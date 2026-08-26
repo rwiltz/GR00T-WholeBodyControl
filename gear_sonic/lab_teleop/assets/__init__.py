@@ -4,7 +4,7 @@
 
 """Robot assets configured for SONIC."""
 
-from gear_sonic.sonic_lab.assets.g1_sonic import (
+from gear_sonic.lab_teleop.assets.g1_sonic import (
     G1_ISAACLAB_TO_MUJOCO_MAPPING,
     G1_MODEL_12_ACTION_SCALE,
     G1_SONIC_CFG,

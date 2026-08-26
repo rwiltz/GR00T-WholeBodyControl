@@ -5,7 +5,7 @@
 """Visualize an Isaac Teleop MCAP replay retargeted for SONIC, inside Isaac Lab.
 
 Spawns SONIC's G1 next to a marker skeleton driven by
-:class:`~gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter.SonicFullBodyRetargeter`,
+:class:`~gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter.SonicFullBodyRetargeter`,
 replaying a recorded full-body tracking session. No headset required.
 
 .. important::
@@ -19,7 +19,7 @@ replaying a recorded full-body tracking session. No headset required.
 
 Usage::
 
-    /path/to/IsaacLab/.venv/bin/python -m gear_sonic.sonic_lab.scripts.replay_viz \\
+    /path/to/IsaacLab/.venv/bin/python -m gear_sonic.lab_teleop.scripts.replay_viz \\
         --mcap /path/to/full_body_*.mcap --viz kit
 """
 
@@ -51,13 +51,13 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab.sim import SimulationCfg, SimulationContext
 
-from gear_sonic.sonic_lab.assets import make_g1_sonic_cfg
-from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
+from gear_sonic.lab_teleop.assets import make_g1_sonic_cfg
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
     SonicReferenceSlice,
 )
-from gear_sonic.sonic_lab.tests.replay_mcap import read_body_frames
+from gear_sonic.lab_teleop.tests.replay_mcap import read_body_frames
 
 #: Highlighted joints: left wrist, right wrist, head (see ``BodyJointIndex``).
 _HIGHLIGHT_JOINTS = (20, 21, 15)

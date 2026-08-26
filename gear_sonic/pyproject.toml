@@ -90,6 +90,21 @@ inference = [
     "scipy",
     "Isaac-GR00T @ git+https://github.com/NVIDIA/Isaac-GR00T.git",
 ]
+# Isaac Lab teleoperation + data collection (Isaac Lab must be installed separately).
+# Shares Isaac Lab's Python environment with [training]; no separate venv is created.
+#
+# onnxruntime-gpu runs the SONIC encoder/decoder. The version must match the CUDA major version
+# of the torch build in the Isaac Lab environment: the 1.22 line targets CUDA 12 / cuDNN 9, while
+# 1.28 links CUDA 13 and fails to load against torch 2.x+cu12x with
+# "libcublasLt.so.13: cannot open shared object file". When the provider cannot load, onnxruntime
+# silently falls back to CPU, where the decoder costs ~17 ms against a 20 ms control period.
+# NOTE: install this extra with --no-deps. gear_sonic pins numpy==1.26.4 / scipy==1.15.3,
+# and resolving those against an Isaac Lab 3.0 environment downgrades its numpy 2.x,
+# which can break Isaac Sim. See docs/source/tutorials/isaaclab_teleop.md.
+# Usage: pip install --no-deps -e ./gear_sonic && pip install onnxruntime-gpu==1.22.0
+lab_teleop = [
+    "onnxruntime-gpu==1.22.0",
+]
 # Training: full RL training stack (Isaac Lab must be installed separately)
 # Usage: pip install -e "gear_sonic[training]"
 training = [

@@ -11,7 +11,7 @@ produces a *plausible human pose*. This harness replays an actual recording thro
 
 Usage::
 
-    /path/to/IsaacLab/.venv/bin/python -m gear_sonic.sonic_lab.tests.replay_mcap \\
+    /path/to/IsaacLab/.venv/bin/python -m gear_sonic.lab_teleop.tests.replay_mcap \\
         /path/to/full_body_*.mcap [--max-frames N] [--dump out.npz]
 
 Sanity checks applied per frame: joint validity, quaternion normalisation, human-scale skeleton
@@ -26,7 +26,7 @@ import sys
 
 import numpy as np
 
-from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
     SonicReferenceSlice,

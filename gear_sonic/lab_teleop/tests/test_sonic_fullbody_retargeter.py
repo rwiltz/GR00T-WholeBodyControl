@@ -11,7 +11,7 @@ numbers.
 
 Run from the repo root with Isaac Lab's interpreter::
 
-    /path/to/IsaacLab/.venv/bin/python -m pytest gear_sonic/sonic_lab/tests -q
+    /path/to/IsaacLab/.venv/bin/python -m pytest gear_sonic/lab_teleop/tests -q
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import torch
 # math touches it. Stub it so this test runs in an Isaac Lab venv without pulling in pyzmq.
 sys.modules.setdefault("zmq", mock.MagicMock())
 
-from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (  # noqa: E402
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (  # noqa: E402
     SONIC_REFERENCE_DIM,
     _SMPL_PARENT_INDICES,
     SonicFullBodyRetargeter,
@@ -140,7 +140,7 @@ def test_zeros_before_first_good_frame() -> None:
 
 def test_pipeline_builds() -> None:
     """The retargeting graph wires up and exposes a single ``action`` output."""
-    from gear_sonic.sonic_lab.retargeters.pipeline import build_sonic_fullbody_pipeline
+    from gear_sonic.lab_teleop.retargeters.pipeline import build_sonic_fullbody_pipeline
 
     combiner = build_sonic_fullbody_pipeline()
     mapping = getattr(combiner, "_output_mapping", None) or getattr(
@@ -156,7 +156,7 @@ def test_isaaclab_quat_conversion_is_wxyz() -> None:
     valid-looking unit quaternion with the wrong orientation, which corrupted the heading term and
     made the robot spin continuously. See ``migrating_to_isaaclab_3-0.rst:1317``.
     """
-    from gear_sonic.sonic_lab.mdp.actions import isaaclab_quat_to_wxyz
+    from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz
 
     # XYZW ordering, distinct components so a wrong permutation cannot pass.
     quat_xyzw = torch.tensor([[0.1, 0.2, 0.3, 0.9]])

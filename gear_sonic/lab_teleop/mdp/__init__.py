@@ -4,7 +4,7 @@
 
 """MDP terms for running SONIC inside Isaac Lab."""
 
-from gear_sonic.sonic_lab.mdp.proprio_history import (
+from gear_sonic.lab_teleop.mdp.proprio_history import (
     SONIC_DECODER_PROPRIO_DIM,
     SONIC_HISTORY_LENGTH,
     SonicProprioHistory,

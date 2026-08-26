@@ -35,7 +35,7 @@ from __future__ import annotations
 from isaacteleop.retargeting_engine.deviceio_source_nodes import FullBodySource
 from isaacteleop.retargeting_engine.interface import OutputCombiner
 
-from gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter import (
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
 )
@@ -95,7 +95,7 @@ def build_sonic_fullbody_pipeline() -> OutputCombiner:
 
     Returns:
         An ``OutputCombiner`` whose single ``"action"`` output is the 83-wide SONIC reference
-        frame described in :mod:`~gear_sonic.sonic_lab.retargeters.sonic_fullbody_retargeter`.
+        frame described in :mod:`~gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter`.
     """
     return make_sonic_fullbody_pipeline_builder()()
 
