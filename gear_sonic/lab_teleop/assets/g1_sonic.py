@@ -114,6 +114,25 @@ def _set_ros_package_paths(cfg: ArticulationCfg) -> None:
     ]
 
 
+def _set_usd_cache_dir(cfg: ArticulationCfg) -> None:
+    """Give the URDF converter a stable output directory so conversion happens once.
+
+    ``UrdfConverterCfg.usd_dir`` defaults to ``None``, and the converter then writes to
+    ``<tmp>/IsaacLab/usd_<timestamp>_<random>`` (``asset_converter_base.py:74``). The name is
+    different on every launch, so the "lazy conversion" the converter documents can never hit:
+    each run re-imports all 68 STL meshes (~66 MB) from scratch and leaves the output behind. A
+    session of a dozen launches accumulated 63 such directories totalling 515 MB here.
+
+    Pointing at a fixed directory lets the converter's own staleness check do its job -- it
+    re-converts only when the asset path, converter settings or source file actually change, so
+    edits to ``main.urdf`` are still picked up. ``.cache/`` is already git-ignored.
+    """
+    usd_dir = _REPO_ROOT / ".cache" / "urdf_usd" / "g1"
+    usd_dir.mkdir(parents=True, exist_ok=True)
+    cfg.spawn.usd_dir = str(usd_dir)
+    cfg.spawn.usd_file_name = "g1_sonic.usd"
+
+
 def _migrate_deprecated_actuator_limits(cfg: ArticulationCfg) -> None:
     """Move ``*_limit_sim`` onto the Isaac Lab 3.0 ``joint_*_limit`` fields.
 
@@ -147,6 +166,7 @@ def make_g1_sonic_cfg(prim_path: str = "{ENV_REGEX_NS}/Robot") -> ArticulationCf
     cfg = copy.deepcopy(_UPSTREAM_CFG)
     _absolutize_asset_path(cfg)
     _set_ros_package_paths(cfg)
+    _set_usd_cache_dir(cfg)
     _migrate_deprecated_actuator_limits(cfg)
     return cfg.replace(prim_path=prim_path)
 
