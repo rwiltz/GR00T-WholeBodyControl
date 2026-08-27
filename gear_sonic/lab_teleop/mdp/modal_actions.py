@@ -608,4 +608,5 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
                     self._raw_actions.copy_(raw)
                     torch.mul(self._raw_actions, self._scale, out=self._processed_actions)
                     self._processed_actions.add_(self._offset)
+                    self._hold_default_if_untracked(reference)
         self._prev_mode = self._mode

@@ -87,7 +87,31 @@ _NUM_BODY_JOINTS = 24
 #: Note index 23 resolves to parent 22 rather than SMPL's canonical 21. This is harmless because
 #: only ``pose_aa[1:22]`` (the first 63 values of ``body_pose``) is consumed downstream.
 _SMPL_PARENT_INDICES: list[int] = [
-    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23,
+    -1,
+    0,
+    0,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    9,
+    9,
+    12,
+    13,
+    14,
+    16,
+    17,
+    18,
+    19,
+    20,
+    22,
+    23,
 ][:_NUM_BODY_JOINTS]
 
 # SMPL body-pose indices (into the 21-joint ``body_pose`` array, i.e. already root-excluded).
@@ -218,9 +242,17 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         outputs["sonic_reference"][0] = frame
 
     def _fallback_frame(self) -> np.ndarray:
-        """Last good frame with the valid flag cleared, or zeros if we never had one."""
+        """Last good frame with the valid flag cleared, or a neutral frame if we never had one.
+
+        The neutral frame is zeros **except** for an identity root quaternion. An all-zero frame
+        looks harmless but is not: a zero quaternion has zero norm, so the heading maths downstream
+        divides by it and produces NaN, which propagates through the encoder into NaN joint targets
+        and hands the physics solver garbage. Identity keeps the frame degenerate-but-finite.
+        """
         if not (self._config.hold_last_on_tracking_loss and self._have_good_frame):
-            return np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
+            neutral = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
+            neutral[SonicReferenceSlice.ROOT_QUAT.start] = 1.0  # wxyz identity
+            return neutral
         held = self._last_good.copy()
         held[SonicReferenceSlice.VALID] = 0.0
         return held
@@ -245,9 +277,7 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         frame[SonicReferenceSlice.WRIST_JOINT_POS] = wrist_joint_pos
         return frame
 
-    def _xr_to_smpl_local(
-        self, body_poses: np.ndarray
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _xr_to_smpl_local(self, body_poses: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """XR global quaternions -> SMPL local axis-angle.
 
         Port of ``compute_from_body_poses`` (``pico_manager_thread_server.py:561-586``). The
@@ -269,12 +299,8 @@ class SonicFullBodyRetargeter(BaseRetargeter):
                 local_rots.append(global_rots[parent].inv() * global_rots[i])
 
         pose_aa = np.array([rot.as_rotvec() for rot in local_rots])
-        body_pose = (
-            torch.from_numpy(pose_aa[1:].flatten()).float().to(self._device).unsqueeze(0)
-        )
-        global_orient = (
-            torch.from_numpy(pose_aa[0]).float().to(self._device).unsqueeze(0)
-        )
+        body_pose = torch.from_numpy(pose_aa[1:].flatten()).float().to(self._device).unsqueeze(0)
+        global_orient = torch.from_numpy(pose_aa[0]).float().to(self._device).unsqueeze(0)
         return body_pose, global_orient
 
     def _smpl_to_reference(

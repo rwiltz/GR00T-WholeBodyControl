@@ -226,6 +226,10 @@ class SonicWholeBodyAction(ActionTerm):
         #: Host mirror of ``_heading_latched.all()``. False only during the brief pre-latch phase,
         #: which is the sole window in which this term reads a CUDA value from Python.
         self._heading_all_latched = False
+        self._warned_nonfinite = False
+        #: Set once a reference has ever been marked valid. Until then the term holds the default
+        #: pose rather than driving SONIC from a frame that carries no tracking.
+        self._seen_valid_reference = False
 
         self._raw_actions = torch.zeros(self.num_envs, SONIC_NUM_ACTIONS, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
@@ -375,6 +379,7 @@ class SonicWholeBodyAction(ActionTerm):
         self._window_all_primed = False
         self._heading_latched[env_ids] = False
         self._heading_all_latched = False
+        self._seen_valid_reference = False
         self._apply_delta_heading[env_ids] = self._identity_quat[env_ids]
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
@@ -410,6 +415,37 @@ class SonicWholeBodyAction(ActionTerm):
                     # arithmetic stays bit-identical to the original expression (no fused FMA).
                     torch.mul(self._raw_actions, self._scale, out=self._processed_actions)
                     self._processed_actions.add_(self._offset)
+                    self._hold_default_if_untracked(actions)
+
+    def _hold_default_if_untracked(self, reference: torch.Tensor) -> None:
+        """Fall back to the default pose when there is nothing trustworthy to track.
+
+        Two cases, both of which otherwise reach the physics solver as garbage:
+
+        * **No tracking yet.** With the body tracker absent the retargeter emits a neutral frame
+          with the valid flag clear. Driving SONIC from a collapsed skeleton makes the robot thrash;
+          standing in its default pose until tracking arrives is the honest behaviour.
+        * **Non-finite output.** A NaN reaching ``set_joint_position_target`` is unrecoverable and
+          silent -- the robot simply goes limp or explodes, with nothing in the log. Guarding here
+          converts that into a single visible warning.
+
+        Args:
+            reference: ``(num_envs, 83)`` reference frame for this step.
+        """
+        if bool((reference[:, SonicReferenceSlice.VALID] > 0.5).any()):
+            self._seen_valid_reference = True
+        finite = bool(torch.isfinite(self._processed_actions).all())
+        if self._seen_valid_reference and finite:
+            return
+        if not finite and not self._warned_nonfinite:
+            print(
+                "[SONIC] non-finite policy output; holding the default pose. "
+                "This usually means the reference carried no valid tracking.",
+                flush=True,
+            )
+            self._warned_nonfinite = True
+        self._processed_actions.copy_(self._offset)
+        self._raw_actions.zero_()
 
     def apply_actions(self) -> None:
         """Write the joint position targets to the articulation."""
