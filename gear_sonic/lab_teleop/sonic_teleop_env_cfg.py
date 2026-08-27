@@ -54,6 +54,8 @@ __all__ = [
     "SonicTeleopG1EnvCfg",
     "SonicTeleopG1HandsEnvCfg",
     "SonicTeleopG1ModalEnvCfg",
+    "SonicTeleopG1ModalLowLatencyEnvCfg",
+    "SonicTeleopG1ModalLowLatencyReplayEnvCfg",
     "SonicTeleopG1ModalReplayEnvCfg",
     "SonicTeleopG1HandsLowLatencyEnvCfg",
     "SonicTeleopG1HandsLowLatencyReplayEnvCfg",
@@ -477,6 +479,34 @@ class SonicTeleopG1ModalEnvCfg(SonicTeleopG1EnvCfg):
 @configclass
 class SonicTeleopG1ModalReplayEnvCfg(SonicTeleopG1ModalEnvCfg):
     """Mode-switching variant wired for MCAP replay."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_modal_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_modal_pipeline_builder(vendor=None)
+
+
+@configclass
+class SonicTeleopG1ModalLowLatencyEnvCfg(SonicTeleopG1ModalEnvCfg):
+    """Mode-switching variant running the **low-latency** SONIC checkpoint.
+
+    Mode switching is checkpoint-independent: the mode id and one-hot occupy the same encoder
+    slots in both checkpoints, and the low-latency variant's shorter reference window is picked up
+    automatically from the encoder graph.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.actions.sonic.checkpoint_dir = LOW_LATENCY_CHECKPOINT_DIR
+
+
+@configclass
+class SonicTeleopG1ModalLowLatencyReplayEnvCfg(SonicTeleopG1ModalLowLatencyEnvCfg):
+    """Low-latency mode-switching variant wired for MCAP replay."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
