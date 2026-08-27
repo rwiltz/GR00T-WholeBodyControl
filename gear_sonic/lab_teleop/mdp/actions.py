@@ -11,7 +11,7 @@ raw joint targets.
 
 Action contract
 ---------------
-The action passed to ``env.step()`` is the 83-wide SONIC reference frame emitted by
+The action passed to ``env.step()`` is the 95-wide SONIC reference frame emitted by
 :class:`~gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter.SonicFullBodyRetargeter`.
 Per control step this term:
 
@@ -388,7 +388,7 @@ class SonicWholeBodyAction(ActionTerm):
         """Run one SONIC control step.
 
         Args:
-            actions: ``(num_envs, 83)`` SONIC reference frames from the teleop retargeter.
+            actions: ``(num_envs, 95)`` SONIC reference frames from the teleop retargeter.
         """
         with torch.inference_mode(), self._policy.compute_stream():
             with self._profiler.stage("total_process_actions"):
@@ -430,7 +430,7 @@ class SonicWholeBodyAction(ActionTerm):
           converts that into a single visible warning.
 
         Args:
-            reference: ``(num_envs, 83)`` reference frame for this step.
+            reference: ``(num_envs, 95)`` reference frame for this step.
         """
         if bool((reference[:, SonicReferenceSlice.VALID] > 0.5).any()):
             self._seen_valid_reference = True
@@ -454,7 +454,7 @@ class SonicWholeBodyAction(ActionTerm):
         )
 
     def _reference_view(self) -> torch.Tensor:
-        """``(num_envs, reference_frames, 83)`` reference window, oldest frame first."""
+        """``(num_envs, reference_frames, 95)`` reference window, oldest frame first."""
         start = self._reference_write + 1
         return self._reference_window[:, start : start + self._reference_frames]
 

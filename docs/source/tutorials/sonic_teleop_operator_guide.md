@@ -66,9 +66,6 @@ pipeline — a different problem from the mode behaving badly.
 **Your viewpoint jumps when you enter walking mode.** It snaps to the robot, and how far it jumps
 depends on how far you have drifted apart. Leaving walking mode freezes it where it is.
 
-**Your wrists do not rotate in walking mode.** Arms reach, but hand orientation is not yet sent;
-see [known gaps](#known-gaps).
-
 **A hitch about once a second while walking** is the planner re-planning. It costs ~50 ms in a
 single control step.
 
@@ -87,10 +84,9 @@ pays a download and an offline machine will not spawn them.
 
 ## Known gaps
 
-* **Hand rotation is not sent in walking mode.** The 83-wide reference carries only a root
-  quaternion, so head and hand orientations are not recoverable from it.
-* **The robot can fall in walking mode**, and the cause is not yet established. The zeroed hand
-  orientations above are the leading suspect. Note whether it starts before or after your first
-  mode switch -- that distinguishes the two paths.
+* **The robot can fall in walking mode**, and the cause is not yet established. Zeroed wrist and
+  head orientations used to be the leading suspect and have now been fixed, so if falls persist
+  the cause lies elsewhere. Note whether it starts before or after your first mode switch --
+  that distinguishes the two paths.
 * **Fingers render but only recently became actuated.** Grasping is new and lightly tested.
 * **The props cost roughly 7.7 ms per frame**, taking replay from ~44 fps to ~33 fps.

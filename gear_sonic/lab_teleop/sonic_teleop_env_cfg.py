@@ -279,7 +279,7 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         # drive this environment. `teleop_se3_agent.py:277-279` selects the Isaac Teleop path with
         #     use_isaac_teleop = not <--teleop_device given> and env_cfg.isaac_teleop is not None
         # and its main loop is device-agnostic: it passes whatever `IsaacTeleopDevice.advance()`
-        # returns straight to `env.step()`. Our pipeline's "action" output is the 83-wide SONIC
+        # returns straight to `env.step()`. Our pipeline's "action" output is the 95-wide SONIC
         # reference, which is exactly what the action term consumes.
         #
         # Note the SE(3) devices (`--teleop_device keyboard|spacemouse|gamepad`) can NOT drive this

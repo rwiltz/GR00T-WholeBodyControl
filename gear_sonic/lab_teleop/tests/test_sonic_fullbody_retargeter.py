@@ -29,8 +29,10 @@ import torch
 sys.modules.setdefault("zmq", mock.MagicMock())
 
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (  # noqa: E402
+    _SMPL_BASE_ROT_WXYZ,
     _SMPL_PARENT_INDICES,
     SONIC_REFERENCE_DIM,
+    VR3_POINT_SMPL_INDICES,
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
     SonicReferenceSlice,
@@ -108,7 +110,7 @@ def test_matches_upstream(retargeter: SonicFullBodyRetargeter, seed: int) -> Non
 def test_output_layout(retargeter: SonicFullBodyRetargeter) -> None:
     """The flat frame is the advertised width and flags itself valid."""
     frame = retargeter._retarget(_make_body_frame(1))  # noqa: SLF001
-    assert frame.shape == (SONIC_REFERENCE_DIM,) == (83,)
+    assert frame.shape == (SONIC_REFERENCE_DIM,) == (95,)
     assert frame.dtype == np.float32
     assert frame[SonicReferenceSlice.VALID] == pytest.approx(1.0)
 
@@ -128,14 +130,61 @@ def test_holds_last_good_frame_on_tracking_loss(
     )
 
 
-def test_zeros_before_first_good_frame() -> None:
-    """With no good frame yet, the fallback is all zeros rather than stale garbage."""
+def test_neutral_frame_before_first_good_frame() -> None:
+    """With no good frame yet the fallback is neutral: zeros, but *unit* quaternions.
+
+    A zero quaternion has zero norm, so the heading maths downstream divides by it and NaN
+    reaches the physics solver. Every quaternion slot must therefore be identity, not zero.
+    """
     fresh = SonicFullBodyRetargeter(
         SonicFullBodyRetargeterConfig(device="cpu"), name="fresh"
     )
-    np.testing.assert_array_equal(
-        fresh._fallback_frame(), np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)  # noqa: SLF001
-    )
+    frame = fresh._fallback_frame()  # noqa: SLF001
+
+    expected = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
+    expected[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
+    expected[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
+    np.testing.assert_array_equal(frame, expected)
+
+
+def test_vr_3point_orientations_match_the_training_definition(
+    retargeter: SonicFullBodyRetargeter,
+) -> None:
+    """The shipped closed form equals the long way round through the FK chain.
+
+    ``vr_3point_local_orn_target`` is ``quat_inv(anchor_quat_w) * point_quat_w``
+    (``gear_sonic/envs/manager_env/mdp/observations.py:1430``). Here the anchor is the retargeted
+    root after ``smpl_root_ytoz_up`` and ``remove_smpl_base_rot``, and the point rotation comes
+    from chaining the SMPL local rotations. The retargeter skips both because the chain
+    telescopes; this test rebuilds them the long way and demands the same answer.
+    """
+    body_poses = _make_body_frame(7)
+    actual = retargeter._retarget(body_poses)[SonicReferenceSlice.VR3_ORN].reshape(3, 4)  # noqa: SLF001
+
+    # Global XR rotations, exactly as ``_xr_to_smpl_local`` forms them.
+    globals_ = sRot.from_quat(body_poses[:, [6, 3, 4, 5]], scalar_first=True)
+    globals_ = globals_ * sRot.from_euler("y", 180, degrees=True)
+    local = [
+        globals_[i] if _SMPL_PARENT_INDICES[i] == -1
+        else globals_[_SMPL_PARENT_INDICES[i]].inv() * globals_[i]
+        for i in range(24)
+    ]
+
+    # Anchor: Y-up -> Z-up left-multiplies the root; remove_smpl_base_rot right-multiplies it.
+    root_z_up = sRot.from_rotvec([np.pi / 2, 0.0, 0.0]) * local[0]
+    base = sRot.from_quat(_SMPL_BASE_ROT_WXYZ, scalar_first=True)
+    anchor = root_z_up * base.inv()
+
+    # Point rotations by walking the FK chain from that same root.
+    chain = [None] * 24
+    chain[0] = root_z_up
+    for i in range(1, 24):
+        chain[i] = chain[_SMPL_PARENT_INDICES[i]] * local[i]
+
+    for slot, joint in enumerate(VR3_POINT_SMPL_INDICES):
+        expected = anchor.inv() * chain[joint]
+        residual = (sRot.from_quat(actual[slot], scalar_first=True).inv() * expected).magnitude()
+        assert residual == pytest.approx(0.0, abs=_TOL)
 
 
 def test_pipeline_builds() -> None:

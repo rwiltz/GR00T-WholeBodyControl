@@ -21,13 +21,14 @@ Upstream references (``gear_sonic/scripts/pico_manager_thread_server.py``):
 
 Output layout
 -------------
-A single flat ``(83,)`` float32 vector, so it composes with the standard
+A single flat ``(95,)`` float32 vector, so it composes with the standard
 ``OutputCombiner({"action": ...})`` convention that ``IsaacTeleopDevice.advance()`` expects::
 
     [0]      valid flag (1.0 = body tracking live this frame, 0.0 = holding last good frame)
     [1:73]   smpl_joints_local  (24, 3) flattened - root-local joint positions
     [73:77]  smpl_root_quat     (4,)    wxyz, Z-up, SMPL base rotation removed
     [77:83]  wrist_joint_pos    (6,)    G1 wrist angles, IsaacLab joint indices [23..28]
+    [83:95]  vr_3point_orn      (3, 4)  wxyz, anchor-local; left wrist, right wrist, head
 
 Consumers must **not** treat this as SONIC's encoder input directly. It is one *reference frame*.
 The downstream ``ActionTerm`` is responsible for (a) stacking a rolling window of these frames,
@@ -74,6 +75,7 @@ from gear_sonic.trl.utils.torch_transform import (
 
 __all__ = [
     "SONIC_REFERENCE_DIM",
+    "VR3_POINT_SMPL_INDICES",
     "SonicFullBodyRetargeter",
     "SonicFullBodyRetargeterConfig",
     "SonicReferenceSlice",
@@ -138,8 +140,22 @@ _HUMAN_JOINTS_INFO_PATH = str(
     / "human_joints_info.pkl"
 )
 
-#: Flat output width: 1 valid flag + 24*3 joints + 4 root quat + 6 wrist angles.
-SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6
+#: SMPL joint indices of the three tracked VR points, in the order SONIC's ``vr_3point``
+#: observations expect: left wrist, right wrist, head. Matches ``GatherVR3PointPosition``
+#: (``g1_deploy_onnx_ref.cpp:1102-1170``) and the training config's ``vr_3point_body``
+#: (``gear_sonic/config/manager_env/commands/terms/motion.yaml:48``), whose third entry is
+#: ``torso_link`` -- the C++ synthesizes it from the torso plus a +0.35 m Z offset precisely to
+#: approximate the head, so a real HMD is the more direct source.
+VR3_POINT_SMPL_INDICES = (20, 21, 15)
+
+#: SMPL's rest orientation, wxyz. ``remove_smpl_base_rot`` right-multiplies the root by its
+#: conjugate, so expressing a joint in the resulting anchor frame leaves this factor behind.
+#: See :meth:`SonicFullBodyRetargeter._vr_3point_orientations`.
+_SMPL_BASE_ROT_WXYZ = np.array([0.5, 0.5, 0.5, 0.5])
+
+#: Flat output width: 1 valid flag + 24*3 joints + 4 root quat + 6 wrist angles + 3*4 vr_3point
+#: orientations.
+SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6 + len(VR3_POINT_SMPL_INDICES) * 4
 
 
 class SonicReferenceSlice:
@@ -149,6 +165,7 @@ class SonicReferenceSlice:
     SMPL_JOINTS = slice(1, 73)
     ROOT_QUAT = slice(73, 77)
     WRIST_JOINT_POS = slice(77, 83)
+    VR3_ORN = slice(83, 95)
 
 
 @dataclass
@@ -252,6 +269,8 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         if not (self._config.hold_last_on_tracking_loss and self._have_good_frame):
             neutral = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
             neutral[SonicReferenceSlice.ROOT_QUAT.start] = 1.0  # wxyz identity
+            # Same reasoning for the three vr_3point quaternions: zeros are not a rotation.
+            neutral[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
             return neutral
         held = self._last_good.copy()
         held[SonicReferenceSlice.VALID] = 0.0
@@ -275,7 +294,49 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         frame[SonicReferenceSlice.SMPL_JOINTS] = smpl_joints_local
         frame[SonicReferenceSlice.ROOT_QUAT] = root_quat
         frame[SonicReferenceSlice.WRIST_JOINT_POS] = wrist_joint_pos
+        frame[SonicReferenceSlice.VR3_ORN] = self._vr_3point_orientations(body_poses)
         return frame
+
+    @staticmethod
+    def _vr_3point_orientations(body_poses: np.ndarray) -> np.ndarray:
+        """Wrist and head orientations in the reference anchor frame, matching training.
+
+        SONIC's ``vr_3point_local_orn_target`` is defined in
+        ``gear_sonic/envs/manager_env/mdp/observations.py:1430`` as
+        ``quat_inv(anchor_quat_w) * point_quat_w`` -- the point's **full** rotation relative to the
+        reference motion's pelvis, not yaw-only, and sharing the anchor that
+        ``vr_3point_local_target`` uses for the positions. Both deployed checkpoints select it
+        (``observation_config.yaml``, ``teleop`` encoder), and the deploy stack agrees: its
+        visualizer reconstructs world orientation as ``root_rot * vr_quat_root_frame``
+        (``gear_sonic_deploy/visualize_motion.py:329-333``).
+
+        The composition collapses. Writing ``R_i`` for the XR global rotations this retargeter
+        already forms in :meth:`_xr_to_smpl_local`, the anchor is
+        ``Rx(90) * R_0 * conj(B)`` (Y-up->Z-up left-multiplies; ``remove_smpl_base_rot`` right-
+        multiplies) while the FK global rotation of joint ``j`` is ``Rx(90) * R_0 * (R_0^-1 * R_j)``
+        because the local-rotation chain telescopes. The ``Rx(90) * R_0`` prefix cancels and only
+        the SMPL base rotation survives::
+
+            q_local_j = B * R_0^-1 * R_j        B = [0.5, 0.5, 0.5, 0.5] wxyz
+
+        which is why no forward kinematics is needed here. The same residual ``B`` is present in
+        the positions, so the two blocks are in one frame.
+
+        Args:
+            body_poses: ``(24, 7)`` array of ``[x, y, z, qx, qy, qz, qw]`` per XR body joint.
+
+        Returns:
+            ``(12,)`` float32, three wxyz quaternions: left wrist, right wrist, head.
+        """
+        indices = (0, *VR3_POINT_SMPL_INDICES)
+        rots = sRot.from_quat(body_poses[indices, :][:, [6, 3, 4, 5]], scalar_first=True)
+        rots = rots * sRot.from_euler("y", 180, degrees=True)
+        base = sRot.from_quat(_SMPL_BASE_ROT_WXYZ, scalar_first=True)
+        root_inv = rots[0].inv()
+        out = np.empty((len(VR3_POINT_SMPL_INDICES), 4), dtype=np.float32)
+        for slot in range(len(VR3_POINT_SMPL_INDICES)):
+            out[slot] = (base * root_inv * rots[slot + 1]).as_quat(scalar_first=True)
+        return out.reshape(-1)
 
     def _xr_to_smpl_local(self, body_poses: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """XR global quaternions -> SMPL local axis-angle.

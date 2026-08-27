@@ -170,7 +170,7 @@ def make_reference_sequence(
     seed: int = 0,
     invalid_steps: set[int] | None = None,
 ) -> list[torch.Tensor]:
-    """Deterministic 83-wide reference frames.
+    """Deterministic 95-wide reference frames.
 
     Root quaternions are normalized so the heading math is well-conditioned, and the validity
     flag is driven explicitly so invalid-reference handling can be exercised.
@@ -183,7 +183,7 @@ def make_reference_sequence(
         invalid_steps: Step indices whose validity flag is forced to 0.
 
     Returns:
-        List of ``(num_envs, 83)`` tensors.
+        List of ``(num_envs, 95)`` tensors.
     """
     device = torch.device(device)
     gen = torch.Generator(device="cpu").manual_seed(seed)

@@ -175,7 +175,7 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         """Yaw of the operator's root orientation, in the reference's own frame.
 
         Args:
-            reference: ``(83,)`` SONIC reference frame.
+            reference: ``(95,)`` SONIC reference frame.
 
         Returns:
             Yaw in radians. Zero when the frame is not marked valid, so an untracked operator

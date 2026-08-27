@@ -7,7 +7,7 @@
 Extends :class:`~gear_sonic.lab_teleop.mdp.actions.SonicWholeBodyAction` with the operator's
 encoder-mode selection, mirroring the real robot's teleop stack. The environment action becomes::
 
-    [ sonic_reference(83) | mode(1) | locomotion_command(8) | ground_visible(1) ]   -> 93
+    [ sonic_reference(95) | mode(1) | locomotion_command(8) | ground_visible(1) ]   -> 105
 
 ``mode`` selects which encoder observation block is populated. SONIC's encoder is mode-exclusive:
 terms outside the active mode stay zero, and the mode id plus its one-hot occupy slots ``[0]`` and
@@ -51,6 +51,7 @@ from gear_sonic.lab_teleop.mdp.sonic_planner import (
 )
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,
+    VR3_POINT_SMPL_INDICES,
     SonicReferenceSlice,
 )
 
@@ -60,7 +61,7 @@ __all__ = [
     "SonicModalWholeBodyActionCfg",
 ]
 
-#: ``[reference(83) | mode(1) | planner_command(8) | ground_visible(1)]``.
+#: ``[reference(95) | mode(1) | planner_command(8) | ground_visible(1)]``.
 SONIC_MODAL_ACTION_DIM = SONIC_REFERENCE_DIM + 1 + SONIC_PLANNER_COMMAND_DIM + 1
 
 #: Prim path of the scene's ground plane, toggled from the controller.
@@ -96,11 +97,9 @@ LOWER_BODY_JOINTS = (
 TELEOP_REFERENCE_FRAMES = 10
 
 #: SMPL joint indices, into the reference's 24-joint **root-local** block, for the three points
-#: ``vr_3point`` carries. Order matches ``GatherVR3PointPosition``: left wrist, right wrist, head.
-#:
-#: The retargeter's ``_SMPL_L_WRIST_IDX = 19`` and friends index the root-*excluded* 21-joint
-#: ``body_pose`` array, so the full-array indices are one higher.
-VR3_SMPL_INDICES = (20, 21, 15)
+#: ``vr_3point`` carries. Shared with the retargeter, which uses the same three joints to build
+#: the matching orientations, so positions and orientations cannot drift apart.
+VR3_SMPL_INDICES = VR3_POINT_SMPL_INDICES
 
 #: Time constant for smoothing the followed anchor yaw, seconds.
 #:
@@ -530,11 +529,11 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         smpl = reference[:, SonicReferenceSlice.SMPL_JOINTS].reshape(1, 24, 3)
         obs[:, TELEOP_VR3_POS] = smpl[:, VR3_SMPL_INDICES, :].reshape(1, -1)
 
-        # Orientations are left zero: the 83-wide reference carries only the root quaternion, not
-        # per-joint orientations, so head and hand rotations are not recoverable from it. Filling
-        # these needs the reference format widened, which would break compatibility with existing
-        # MCAP captures -- deliberately out of scope here.
-        obs[:, TELEOP_VR3_ORN] = 0.0
+        # vr_3point orientations, already in the anchor frame and already ordered left wrist,
+        # right wrist, head. The retargeter computes them because it is the only node that sees
+        # the raw XR joint rotations; see
+        # ``SonicFullBodyRetargeter._vr_3point_orientations`` for the frame derivation.
+        obs[:, TELEOP_VR3_ORN] = reference[:, SonicReferenceSlice.VR3_ORN]
 
     def process_actions(self, actions: torch.Tensor) -> None:
         """Run one control step in whichever mode the operator selected.
