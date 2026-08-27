@@ -439,13 +439,63 @@ class SonicWholeBodyAction(ActionTerm):
             return
         if not finite and not self._warned_nonfinite:
             print(
-                "[SONIC] non-finite policy output; holding the default pose. "
-                "This usually means the reference carried no valid tracking.",
+                "[SONIC] non-finite policy output; holding the default pose.\n"
+                f"{self._nonfinite_diagnosis(reference)}",
                 flush=True,
             )
             self._warned_nonfinite = True
         self._processed_actions.copy_(self._offset)
         self._raw_actions.zero_()
+
+    def _nonfinite_diagnosis(self, reference: torch.Tensor) -> str:
+        """Name the input that is actually non-finite, rather than guessing at a cause.
+
+        A NaN in the joint targets has several possible sources -- the operator's reference, the
+        measured articulation state feeding proprioception, the assembled encoder input, or the
+        policy itself -- and they call for completely different fixes. Blaming the reference on
+        sight sends the reader down the wrong path when the robot has simply exploded and is
+        handing back a non-finite root transform.
+
+        Runs once, on the first failure, so the cost does not matter.
+
+        Args:
+            reference: ``(num_envs, 95)`` reference frame for this step.
+
+        Returns:
+            Indented multi-line report naming each non-finite input, or a line saying every input
+            was finite -- which would point at the ONNX graphs themselves.
+        """
+        data = self._asset.data
+        checks: list[tuple[str, torch.Tensor]] = [
+            ("reference (from the retargeter)", reference),
+            ("joint_pos (measured)", data.joint_pos.torch),
+            ("joint_vel (measured)", data.joint_vel.torch),
+            ("root_quat_w (measured)", data.root_quat_w.torch),
+            ("projected_gravity_b (measured)", data.projected_gravity_b.torch),
+            ("root_ang_vel_b (measured)", data.root_ang_vel_b.torch),
+            ("encoder input", self._policy.encoder_obs),
+        ]
+        culprits = [
+            f"    {name}: {int((~torch.isfinite(t)).sum())} non-finite of {t.numel()}"
+            for name, t in checks
+            if not bool(torch.isfinite(t).all())
+        ]
+        valid = bool((reference[:, SonicReferenceSlice.VALID] > 0.5).any())
+        lines = [f"    reference valid flag this step: {valid}"]
+        if culprits:
+            lines.append("    non-finite inputs, earliest in the chain first:")
+            lines.extend(culprits)
+            if any("measured" in c for c in culprits):
+                lines.append(
+                    "    A measured value is non-finite, so the articulation itself has already "
+                    "diverged -- look upstream of SONIC, not at the reference."
+                )
+        else:
+            lines.append(
+                "    Every input was finite, so the non-finite value came out of the encoder or "
+                "decoder graph itself."
+            )
+        return "\n".join(lines)
 
     def apply_actions(self) -> None:
         """Write the joint position targets to the articulation."""
