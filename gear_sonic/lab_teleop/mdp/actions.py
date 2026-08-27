@@ -133,8 +133,22 @@ class SonicWholeBodyActionCfg(ActionTermCfg):
     action_scale: dict[str, float] = MISSING
     """Per-joint action scale, keyed by joint-name regex (``G1_MODEL_12_ACTION_SCALE``)."""
 
-    policy_device: str = "cuda:0"
-    """Device for ONNX inference. See the module note on CPU cost at 50 Hz."""
+    policy_device: str = "auto"
+    """Device for ONNX inference, independent of the physics device.
+
+    ``"auto"`` (default) puts inference on a GPU whenever one is available, **even when physics
+    runs on CPU**. That split is almost always what you want: the SONIC decoder is ~37M params and
+    costs ~17 ms per step on CPU against a 20 ms control period, so CPU inference alone puts the
+    environment below real time, while CPU *physics* is merely slower. Resolution order:
+
+    * physics already on CUDA -> the same GPU, so nothing crosses the bus;
+    * physics on CPU and CUDA available -> the current CUDA device;
+    * no CUDA -> CPU, with the runner warning about the cost.
+
+    Pass an explicit device (``"cuda:1"``, ``"cpu"``) to override. Note that when this differs
+    from the physics device the encoder input and the resulting action must cross the bus each
+    step; that transfer is far cheaper than CPU inference, but it is not free.
+    """
 
     enable_profiling: bool = False
     """Record per-stage CUDA-event timings. Off by default; see :meth:`profiling_report`."""
@@ -153,7 +167,10 @@ class SonicWholeBodyAction(ActionTerm):
         super().__init__(cfg, env)
         self._env = env
 
-        self._policy = SonicOnnxPolicy(cfg.checkpoint_dir, device=self.device)
+        self._policy_device = self._resolve_policy_device(
+            getattr(cfg, "policy_device", "auto"), self.device
+        )
+        self._policy = SonicOnnxPolicy(cfg.checkpoint_dir, device=self._policy_device)
         if self.num_envs != self._policy.BATCH:
             # Fail here rather than at the first control step. The shipped graphs have a static
             # batch axis, so a vectorized scene can never work -- and letting it through produces
@@ -224,6 +241,45 @@ class SonicWholeBodyAction(ActionTerm):
         )
 
         self._warn_if_xr_anchor_missing(env)
+
+    @staticmethod
+    def _resolve_policy_device(
+        configured: str | None, env_device: torch.device | str
+    ) -> torch.device:
+        """Choose the ONNX inference device.
+
+        See :attr:`SonicWholeBodyActionCfg.policy_device` for why the default prefers a GPU even
+        when physics is on CPU.
+
+        Args:
+            configured: The config value; ``"auto"``/``None`` selects automatically.
+            env_device: Device the environment's tensors live on.
+
+        Returns:
+            A concrete device. CUDA devices are always pinned to an explicit ordinal so
+            onnxruntime and torch cannot end up on different GPUs.
+        """
+        if configured and configured != "auto":
+            device = torch.device(configured)
+            if device.type == "cuda" and not torch.cuda.is_available():
+                raise ValueError(
+                    f"policy_device={configured!r} requests CUDA, but torch reports no CUDA "
+                    "devices. Use 'cpu', or 'auto' to pick whatever is present."
+                )
+            if device.type == "cuda" and device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            return device
+
+        env_device = torch.device(env_device)
+        if env_device.type == "cuda":
+            # Physics is already on a GPU -- run inference on that same one, so the hot path
+            # stays entirely device-resident and multi-GPU hosts do not split across cards.
+            if env_device.index is None:
+                return torch.device("cuda", torch.cuda.current_device())
+            return env_device
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
 
     @staticmethod
     def _warn_if_xr_anchor_missing(env: ManagerBasedEnv) -> None:

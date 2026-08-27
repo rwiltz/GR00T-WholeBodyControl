@@ -602,9 +602,13 @@ class SonicOnnxPolicy:
         obs = self.encoder_obs
         batch = obs.shape[0]
         variant = self.variant
-        obs[:, variant.smpl_joints] = smpl_joints.reshape(batch, -1)
-        obs[:, variant.smpl_anchor_ori] = anchor_ori_6d.reshape(batch, -1)
-        obs[:, variant.wrist_joint_pos] = wrist_joint_pos.reshape(batch, -1)
+        # ``.to`` is a no-op returning self when the device already matches, so the matched case
+        # stays zero-copy. When inference runs on a different device than physics (CPU physics
+        # with GPU inference, the default), this is where the reference crosses the bus.
+        device = obs.device
+        obs[:, variant.smpl_joints] = smpl_joints.reshape(batch, -1).to(device)
+        obs[:, variant.smpl_anchor_ori] = anchor_ori_6d.reshape(batch, -1).to(device)
+        obs[:, variant.wrist_joint_pos] = wrist_joint_pos.reshape(batch, -1).to(device)
         return obs
 
     @staticmethod
