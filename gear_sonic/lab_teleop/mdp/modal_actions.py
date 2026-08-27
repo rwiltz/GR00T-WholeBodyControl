@@ -7,7 +7,7 @@
 Extends :class:`~gear_sonic.lab_teleop.mdp.actions.SonicWholeBodyAction` with the operator's
 encoder-mode selection, mirroring the real robot's teleop stack. The environment action becomes::
 
-    [ sonic_reference(83) | mode(1) | locomotion_command(8) ]   -> 92
+    [ sonic_reference(83) | mode(1) | locomotion_command(8) | ground_visible(1) ]   -> 93
 
 ``mode`` selects which encoder observation block is populated. SONIC's encoder is mode-exclusive:
 terms outside the active mode stay zero, and the mode id plus its one-hot occupy slots ``[0]`` and
@@ -60,8 +60,11 @@ __all__ = [
     "SonicModalWholeBodyActionCfg",
 ]
 
-#: ``[reference(83) | mode(1) | command(8)]``.
-SONIC_MODAL_ACTION_DIM = SONIC_REFERENCE_DIM + 1 + SONIC_PLANNER_COMMAND_DIM
+#: ``[reference(83) | mode(1) | planner_command(8) | ground_visible(1)]``.
+SONIC_MODAL_ACTION_DIM = SONIC_REFERENCE_DIM + 1 + SONIC_PLANNER_COMMAND_DIM + 1
+
+#: Prim path of the scene's ground plane, toggled from the controller.
+GROUND_PLANE_PRIM_PATH = "/World/GroundPlane"
 
 #: Encoder mode ids, matching the checkpoint's ``encoder_modes``.
 ENCODER_MODE_TELEOP = 1
@@ -187,6 +190,8 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._anchor_z = float(self._xr_cfg.anchor_pos[2]) if self._xr_cfg is not None else 0.0
         self._anchor_yaw: float | None = None
         self._prev_mode = ENCODER_MODE_SMPL
+        #: ``None`` until the first action arrives, so the first frame always applies and logs.
+        self._ground_visible: bool | None = None
 
     @property
     def action_dim(self) -> int:
@@ -214,6 +219,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._anchor_yaw = None
         self._qpos_history[:] = 0.0
         self._qpos_seeded = False
+        self._ground_visible = None
 
     def _ensure_planner(self) -> SonicVelocityPlanner:
         """Construct the velocity planner on first use.
@@ -223,12 +229,47 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
                 construction so environments that never enter teleop mode do not require it.
         """
         if self._planner is None:
+            print("[SONIC] building the velocity planner (first entry to teleop mode)", flush=True)
             self._planner = SonicVelocityPlanner(
                 checkpoint_path=self._planner_checkpoint,
                 device=self._policy_device,
                 replan_interval=self.cfg.planner_replan_interval,
             )
         return self._planner
+
+    @staticmethod
+    def _mode_name(mode: int) -> str:
+        """Human-readable encoder mode, for operator-facing logs."""
+        return {ENCODER_MODE_TELEOP: "teleop", ENCODER_MODE_SMPL: "smpl"}.get(mode, str(mode))
+
+    def _apply_ground_visibility(self, visible: bool) -> None:
+        """Show or hide the ground plane, and say so.
+
+        The operator has no other feedback about which mode they are in, and mode changes are only
+        visible through behaviour -- legs starting to walk, or the anchor snapping. Logging the
+        transition makes a session where "nothing happened" tell the two failure modes apart: the
+        toggle never firing, versus the toggle firing and the mode behaving wrongly.
+        """
+        if self._ground_visible is not None and visible == self._ground_visible:
+            return
+        self._ground_visible = visible
+        try:
+            from isaaclab.sim.utils import set_prim_visibility
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(GROUND_PLANE_PRIM_PATH) if stage is not None else None
+            if prim is not None and prim.IsValid():
+                set_prim_visibility(prim, visible)
+                print(f"[SONIC] ground plane {'shown' if visible else 'hidden'}", flush=True)
+                return
+        except Exception as exc:  # noqa: BLE001 - outside Isaac Sim there is no stage to touch
+            print(f"[SONIC] ground plane toggle unavailable: {exc}", flush=True)
+            return
+        print(
+            f"[SONIC] ground plane prim {GROUND_PLANE_PRIM_PATH!r} not found; nothing toggled",
+            flush=True,
+        )
 
     @staticmethod
     def _yaw_of(quat_wxyz: np.ndarray) -> float:
@@ -434,14 +475,23 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             raise ValueError(
                 f"expected a {SONIC_MODAL_ACTION_DIM}-wide action "
                 f"({SONIC_REFERENCE_DIM} reference + 1 mode + {SONIC_PLANNER_COMMAND_DIM} "
-                f"command), got {actions.shape[-1]}"
+                f"command + 1 ground_visible), got {actions.shape[-1]}"
             )
 
         actions = actions.to(self.device)
         reference = actions[:, :SONIC_REFERENCE_DIM]
         mode = int(actions[0, SONIC_REFERENCE_DIM].item())
-        command = actions[0, SONIC_REFERENCE_DIM + 1 :].detach().float().cpu().numpy()
+        tail = actions[0, SONIC_REFERENCE_DIM + 1 :].detach().float().cpu().numpy()
+        command = tail[:SONIC_PLANNER_COMMAND_DIM]
+        ground_visible = bool(tail[SONIC_PLANNER_COMMAND_DIM] > 0.5)
         self._mode = mode if mode in (ENCODER_MODE_TELEOP, ENCODER_MODE_SMPL) else ENCODER_MODE_SMPL
+        if self._mode != self._prev_mode:
+            print(
+                f"[SONIC] mode {self._mode_name(self._prev_mode)} -> "
+                f"{self._mode_name(self._mode)}",
+                flush=True,
+            )
+        self._apply_ground_visibility(ground_visible)
 
         # Tracked in every mode so a return to teleop plans from where the robot actually is.
         self._track_robot_pose()

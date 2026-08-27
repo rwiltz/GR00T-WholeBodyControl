@@ -9,9 +9,13 @@ Sits in series after the stock
 into the form ``planner_sonic.onnx`` consumes and adding the operator's mode selection::
 
     ControllersSource -> LocomotionRootCmdRetargeter -> SonicTeleopCommandRetargeter -> action
-                         [vel_x, vel_y, rot_vel_z,      [mode, target_vel,
-                          hip_height]                    movement_dir(3),
-                                                         facing_dir(3), height]
+                         [vel_x, vel_y, rot_vel_z,      [mode, target_vel, movement_dir(3),
+                          hip_height]                    facing_dir(3), height,
+                                                         ground_visible]
+
+Controls: the **left** primary click toggles the encoder mode, the **right** primary click toggles
+ground-plane visibility. Opposite hands so the two cannot be confused by feel, and clicks rather
+than trigger or squeeze because those are already claimed by the tri-hand retargeters.
 
 Everything here is a pure function of **operator input**, which is why it belongs on the Isaac
 Teleop side of the boundary. The planner it feeds does not: that is closed-loop on the robot's
@@ -77,8 +81,8 @@ __all__ = [
 SONIC_ENCODER_MODE_TELEOP = 1
 SONIC_ENCODER_MODE_SMPL = 2
 
-#: ``[mode, target_vel, movement_dir(3), facing_dir(3), height]``.
-SONIC_COMMAND_DIM = 9
+#: ``[mode, target_vel, movement_dir(3), facing_dir(3), height, ground_visible]``.
+SONIC_COMMAND_DIM = 10
 
 
 class SonicTeleopCommandRetargeter(BaseRetargeter):
@@ -88,7 +92,10 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         name: Node name within the retargeting graph.
         default_mode: Mode selected at start and restored on reset.
         toggle_side: Controller whose primary button toggles the mode. Trigger and squeeze are
-            already claimed by the tri-hand retargeters, so a click is used.
+            already claimed by the tri-hand retargeters, so clicks are used.
+        ground_toggle_side: Controller whose primary button toggles ground-plane visibility. The
+            opposite hand from the mode toggle, so the two cannot be confused by feel.
+        default_ground_visible: Ground visibility at start and after reset.
 
     Raises:
         ValueError: If ``toggle_side`` is not ``"left"`` or ``"right"``.
@@ -101,25 +108,39 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         name: str = "sonic_command",
         default_mode: int = SONIC_ENCODER_MODE_SMPL,
         toggle_side: str = "left",
+        ground_toggle_side: str = "right",
+        default_ground_visible: bool = False,
     ) -> None:
-        if toggle_side not in ("left", "right"):
-            raise ValueError(f"toggle_side must be 'left' or 'right', got {toggle_side!r}")
+        for label, side in (
+            ("toggle_side", toggle_side),
+            ("ground_toggle_side", ground_toggle_side),
+        ):
+            if side not in ("left", "right"):
+                raise ValueError(f"{label} must be 'left' or 'right', got {side!r}")
         # Set before super().__init__: BaseRetargeter calls input_spec() during construction.
         self._toggle_side = toggle_side
         self._default_mode = int(default_mode)
         self._mode = int(default_mode)
         self._toggle_was_down = False
+        self._ground_toggle_side = ground_toggle_side
+        self._default_ground_visible = bool(default_ground_visible)
+        self._ground_visible = bool(default_ground_visible)
+        self._ground_was_down = False
         self._out = np.zeros(SONIC_COMMAND_DIM, dtype=np.float32)
         super().__init__(name=name)
 
     def input_spec(self) -> RetargeterIOType:
         """Root command, the toggling controller, and the operator's own reference frame."""
+        controllers = {
+            f"controller_{side}": OptionalType(ControllerInput())
+            for side in {self._toggle_side, self._ground_toggle_side}
+        }
         return {
+            **controllers,
             "root_command": TensorGroupType(
                 "root_command",
                 [NDArrayType("command", shape=(4,), dtype=DLDataType.FLOAT, dtype_bits=32)],
             ),
-            f"controller_{self._toggle_side}": OptionalType(ControllerInput()),
             "sonic_reference": TensorGroupType(
                 "sonic_reference",
                 [
@@ -174,6 +195,17 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
             self._mode = self._default_mode
             self._toggle_was_down = False
 
+        if context.execution_events.reset:
+            self._ground_visible = self._default_ground_visible
+            self._ground_was_down = False
+
+        ground_controller = inputs[f"controller_{self._ground_toggle_side}"]
+        if not ground_controller.is_none:
+            gdown = bool(ground_controller[ControllerInputIndex.PRIMARY_CLICK])
+            if gdown and not self._ground_was_down:
+                self._ground_visible = not self._ground_visible
+            self._ground_was_down = gdown
+
         controller = inputs[f"controller_{self._toggle_side}"]
         if not controller.is_none:
             down = bool(controller[ControllerInputIndex.PRIMARY_CLICK])
@@ -211,4 +243,5 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         # else: leave both direction vectors zero -- the action term substitutes idle directions
         # derived from measured robot state, which is not available here.
         self._out[8] = hip_height
+        self._out[9] = 1.0 if self._ground_visible else 0.0
         outputs[self.OUTPUT_NAME][0] = self._out
