@@ -127,6 +127,17 @@ class SonicModalWholeBodyActionCfg(SonicWholeBodyActionCfg):
     planner_replan_interval: int = 0
     """Frames consumed before re-planning. ``0`` consumes each plan fully."""
 
+    anchor_pan_speed: float = 1.0
+    """Metres per second the left stick pans the XR anchor in ``smpl`` mode.
+
+    Lets the operator reposition themselves in the world without physically walking, which matters
+    because the play space is small and the props sit 5 ft away. Set to ``0.0`` to disable.
+
+    This is smooth VR locomotion and induces vection in some people. The default is deliberately
+    walking-pace rather than fast; raise it only if the drift feels sluggish rather than
+    uncomfortable.
+    """
+
 
 class SonicModalWholeBodyAction(SonicWholeBodyAction):
     """SONIC control with operator-selectable encoder mode."""
@@ -195,6 +206,9 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._initial_anchor_pos = tuple(self._xr_cfg.anchor_pos) if self._xr_cfg else None
         self._initial_anchor_rot = tuple(self._xr_cfg.anchor_rot) if self._xr_cfg else None
         self._anchor_yaw: float | None = None
+        #: World-frame locomotion command for the current step, used to pan the anchor in smpl
+        #: mode. Held here because the anchor update runs before the mode branch consumes it.
+        self._pan_command: np.ndarray | None = None
         self._prev_mode = ENCODER_MODE_SMPL
         #: ``None`` until the first action arrives, so the first frame always applies and logs.
         self._ground_visible: bool | None = None
@@ -223,6 +237,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._mode = ENCODER_MODE_SMPL
         self._prev_mode = ENCODER_MODE_SMPL
         self._anchor_yaw = None
+        self._pan_command = None
         self._restore_anchor()
         self._qpos_history[:] = 0.0
         self._qpos_seeded = False
@@ -318,7 +333,10 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         feed the gait's vertical bob into the headset. Yaw is followed alone and smoothed, for the
         same reason Isaac Lab's own ``FOLLOW_PRIM_SMOOTHED`` does both.
         """
-        if self._xr_cfg is None or mode != ENCODER_MODE_TELEOP:
+        if self._xr_cfg is None:
+            return
+        if mode != ENCODER_MODE_TELEOP:
+            self._pan_anchor()
             return
         from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz
 
@@ -339,6 +357,37 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._xr_cfg.anchor_pos = (float(root_pos[0]), float(root_pos[1]), self._anchor_z)
         # XrCfg.anchor_rot is XYZW, not WXYZ (xr_anchor_manager.py:110).
         self._xr_cfg.anchor_rot = (0.0, 0.0, float(np.sin(half)), float(np.cos(half)))
+
+    def _pan_anchor(self) -> None:
+        """Slide the anchor across the ground plane from the operator's stick, in ``smpl`` mode.
+
+        Safe precisely because the reference carries **no root translation**: it is root-local
+        joints plus a root quaternion, and SONIC infers locomotion from body pose rather than from
+        a commanded displacement (``sonic_fullbody_retargeter.py:286``). Moving the anchor
+        therefore changes only where the operator sees the world from; it cannot inject a spurious
+        displacement into the reference.
+
+        The left stick is free in this mode -- it only drives the planner in ``teleop`` -- so the
+        same control walks the robot there and pans the operator here.
+
+        Height and rotation are untouched: this is a translation on the ground plane, so the
+        operator's sense of up and of facing are preserved.
+        """
+        speed = self.cfg.anchor_pan_speed
+        if speed <= 0.0 or self._pan_command is None:
+            return
+        target_vel = float(self._pan_command[0])
+        if target_vel <= 1e-4:
+            return
+        direction = self._pan_command[1:4]
+        dt = float(getattr(self._env, "step_dt", 0.02))
+        step = target_vel * speed * dt
+        pos = self._xr_cfg.anchor_pos
+        self._xr_cfg.anchor_pos = (
+            float(pos[0] + direction[0] * step),
+            float(pos[1] + direction[1] * step),
+            float(pos[2]),
+        )
 
     def _to_world_directions(self, command: np.ndarray) -> np.ndarray:
         """Rotate the operator's commanded directions into the world frame.
@@ -520,9 +569,12 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
 
         # Tracked in every mode so a return to teleop plans from where the robot actually is.
         self._track_robot_pose()
+        # Rotated once, up front: teleop feeds it to the planner and smpl pans the anchor with it,
+        # and both want world frame.
+        command = self._to_world_directions(command)
+        self._pan_command = command
         self._update_anchor(self._mode)
         if self._mode == ENCODER_MODE_TELEOP:
-            command = self._to_world_directions(command)
             # Planner runs outside inference_mode: it is numpy/onnxruntime and reads articulation
             # state, which the surrounding context does not need to guard.
             self._advance_planner(command)
