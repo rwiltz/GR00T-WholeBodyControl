@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pathlib
 
-from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 import isaaclab.envs.mdp as base_mdp
 from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
@@ -35,6 +35,7 @@ from isaaclab.managers import (
 from isaaclab.scene import InteractiveSceneCfg
 import isaaclab.sim as sim_utils
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.configclass import configclass
 
 from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
@@ -50,7 +51,10 @@ __all__ = [
     "ANCHOR_ROT_YAW_RIGHT_90",
     "DEFAULT_CHECKPOINT_DIR",
     "LOW_LATENCY_CHECKPOINT_DIR",
+    "PACKING_TABLE_Z",
     "PELVIS_ANCHOR_Z_OFFSET",
+    "PROP_FORWARD_DISTANCE",
+    "STEERING_WHEEL_Z",
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
     "SonicTeleopG1LowLatencyEnvCfg",
@@ -64,6 +68,20 @@ __all__ = [
 #: ``x, y, z, w``. Flip the sign of the Z term for 90 deg to the left.
 _SQRT_HALF = 0.7071067811865476
 ANCHOR_ROT_YAW_RIGHT_90 = (0.0, 0.0, -_SQRT_HALF, _SQRT_HALF)
+
+#: How far in front of the robot the manipulation props sit, in metres (~5 ft).
+#:
+#: ``locomanip_pick_place`` puts its table at 0.55 m, close enough to reach while standing still.
+#: Here the props are deliberately out of reach so the operator has to walk to them, which is the
+#: point of having a locomotion mode at all.
+PROP_FORWARD_DISTANCE = 1.524
+
+#: Table origin height. The USD's surface sits ~1.0 m above its own origin, so a -0.3 origin puts
+#: the top near 0.70 m -- the same relationship ``locomanip_pick_place`` relies on.
+PACKING_TABLE_Z = -0.3
+
+#: Resting height of the steering wheel, i.e. on the table surface.
+STEERING_WHEEL_Z = 0.6996
 
 #: Vertical offset from the G1 pelvis down to the operator's floor plane, in metres.
 #:
@@ -114,6 +132,41 @@ class SonicTeleopSceneCfg(InteractiveSceneCfg):
     )
 
     robot = make_g1_sonic_cfg(prim_path="{ENV_REGEX_NS}/Robot")
+
+    # Manipulation props, borrowed from ``locomanip_pick_place``. Placed at
+    # PROP_FORWARD_DISTANCE rather than that env's 0.55 m, which puts them within arm's reach of a
+    # standing robot: here the operator is expected to *walk* to them in teleop mode, so they need
+    # to start outside the reach of full-body tracking alone.
+    #
+    # The robot spawns with identity rotation, i.e. facing +X, so "in front" is +X. The locomanip
+    # scene has its own convention and its coordinates are not transferable verbatim.
+    packing_table = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/PackingTable",
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=[PROP_FORWARD_DISTANCE, 0.0, PACKING_TABLE_Z], rot=[0.0, 0.0, 0.0, 1.0]
+        ),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/PackingTable/packing_table.usd",
+            # Kinematic: the table is scenery and must not be shoved around by a stumbling robot.
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+        ),
+    )
+
+    #: Grabbable prop, resting on the table. Left dynamic so the hands can actually move it.
+    steering_wheel = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/SteeringWheel",
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=[PROP_FORWARD_DISTANCE - 0.1, 0.0, STEERING_WHEEL_Z], rot=[0.0, 0.0, 0.0, 1.0]
+        ),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=(
+                f"{ISAACLAB_NUCLEUS_DIR}/Mimic/pick_place_task/pick_place_assets/"
+                "steering_wheel.usd"
+            ),
+            scale=(0.75, 0.75, 0.75),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+        ),
+    )
 
 
 @configclass
