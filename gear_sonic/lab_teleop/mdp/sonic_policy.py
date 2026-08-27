@@ -99,11 +99,13 @@ __all__ = [
     "SONIC_VARIANTS_BY_ENCODER_DIM",
     "SONIC_VARIANT_LOW_LATENCY",
     "SONIC_VARIANT_V1_1",
+    "SONIC_CHECKPOINT_DOWNLOAD_FLAGS",
     "SmplEncoderSlots",
     "SonicOnnxPolicy",
     "SonicVariant",
     "smpl_anchor_orientation",
     "smpl_anchor_orientation_heading",
+    "sonic_download_hint",
 ]
 
 SONIC_ENCODER_INPUT_DIM = 1751
@@ -203,6 +205,34 @@ SONIC_VARIANT_LOW_LATENCY = SonicVariant(
 
 #: Keyed by encoder input width so the variant is read off the graph itself. Selecting on the
 #: directory name instead would silently mismatch if a checkpoint were moved or renamed.
+#: Checkpoint directory name -> the ``download_from_hf.py`` flag that fetches it.
+#:
+#: Keyed by directory name because that is all a failure site has to work with. Getting this wrong
+#: is worse than saying nothing: a hint naming the wrong checkpoint sends the reader off to
+#: download something they already have.
+SONIC_CHECKPOINT_DOWNLOAD_FLAGS = {
+    "sonic_v1_1": "--sonic-v1-1",
+    "low_latency": "--low-latency",
+}
+
+
+def sonic_download_hint(checkpoint_dir: str | pathlib.Path) -> str:
+    """Return the ``download_from_hf.py`` command that fetches *this* checkpoint.
+
+    Args:
+        checkpoint_dir: Directory the caller expected the ONNX graphs in.
+
+    Returns:
+        A ready-to-paste command. Unrecognised directories get a command listing every known
+        flag rather than a confidently wrong one.
+    """
+    flag = SONIC_CHECKPOINT_DOWNLOAD_FLAGS.get(pathlib.Path(checkpoint_dir).name)
+    if flag is None:
+        options = " | ".join(sorted(set(SONIC_CHECKPOINT_DOWNLOAD_FLAGS.values())))
+        return f"python download_from_hf.py [{options}]"
+    return f"python download_from_hf.py {flag}"
+
+
 SONIC_VARIANTS_BY_ENCODER_DIM = {
     variant.encoder_input_dim: variant
     for variant in (SONIC_VARIANT_V1_1, SONIC_VARIANT_LOW_LATENCY)
@@ -332,8 +362,8 @@ class SonicOnnxPolicy:
             if not path.is_file():
                 raise FileNotFoundError(
                     f"SONIC ONNX not found: {path}\n"
-                    "Fetch it per the repo README, e.g.:\n"
-                    "    python download_from_hf.py --sonic-v1-1"
+                    "Fetch this checkpoint with:\n"
+                    f"    {sonic_download_hint(self._dir)}"
                 )
 
         self.device = torch.device(device)

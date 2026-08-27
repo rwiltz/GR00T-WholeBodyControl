@@ -349,8 +349,10 @@ def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:
         if not (resolved / name).is_file()
     ]
     if missing:
+        from gear_sonic.lab_teleop.mdp.sonic_policy import sonic_download_hint
+
         raise FileNotFoundError(
-            f"Missing {missing} in {resolved}.\nFetch per the README:\n"
-            "    python download_from_hf.py --sonic-v1-1"
+            f"Missing {missing} in {resolved}.\nFetch this checkpoint with:\n"
+            f"    {sonic_download_hint(resolved)}"
         )
     return str(resolved)
