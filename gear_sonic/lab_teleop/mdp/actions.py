@@ -66,13 +66,12 @@ import torch
 
 from gear_sonic.lab_teleop.mdp.profiling import StageProfiler, StageStats
 from gear_sonic.lab_teleop.mdp.proprio_history import (
-    SONIC_HISTORY_LENGTH,
     SonicProprioHistory,
 )
 from gear_sonic.lab_teleop.mdp.sonic_policy import (
     SONIC_NUM_ACTIONS,
     SonicOnnxPolicy,
-    smpl_anchor_orientation_heading,
+    smpl_anchor_orientation,
 )
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,
@@ -189,10 +188,16 @@ class SonicWholeBodyAction(ActionTerm):
         )
         # Mirrored ring of reference frames; the encoder consumes the whole window each step.
         # Doubled length keeps the chronological window a contiguous slice -- see .proprio_history.
+        #
+        # The window length comes from the *checkpoint*, not from SONIC_HISTORY_LENGTH: the
+        # low-latency export consumes 4 reference frames while its decoder still takes the same
+        # 10-frame proprioception history. Conflating the two would silently feed the encoder a
+        # wrongly-shaped reference block.
+        self._reference_frames = self._policy.variant.reference_frames
         self._reference_window = torch.zeros(
-            self.num_envs, 2 * SONIC_HISTORY_LENGTH, SONIC_REFERENCE_DIM, device=self.device
+            self.num_envs, 2 * self._reference_frames, SONIC_REFERENCE_DIM, device=self.device
         )
-        self._reference_write = SONIC_HISTORY_LENGTH - 1
+        self._reference_write = self._reference_frames - 1
         self._window_primed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         #: Host mirror of ``_window_primed.all()``; keeps the backfill off the steady-state path.
         self._window_all_primed = False
@@ -357,15 +362,15 @@ class SonicWholeBodyAction(ActionTerm):
         )
 
     def _reference_view(self) -> torch.Tensor:
-        """``(num_envs, 10, 83)`` reference window, oldest frame first."""
+        """``(num_envs, reference_frames, 83)`` reference window, oldest frame first."""
         start = self._reference_write + 1
-        return self._reference_window[:, start : start + SONIC_HISTORY_LENGTH]
+        return self._reference_window[:, start : start + self._reference_frames]
 
     def _push_reference(self, reference: torch.Tensor) -> None:
         """Advance the reference ring, backfilling it on the first frame after a reset."""
-        write = (self._reference_write + 1) % SONIC_HISTORY_LENGTH
+        write = (self._reference_write + 1) % self._reference_frames
         self._reference_window[:, write] = reference
-        self._reference_window[:, write + SONIC_HISTORY_LENGTH] = reference
+        self._reference_window[:, write + self._reference_frames] = reference
         # Pending-backfill is a reset-driven fact the host already knows, so steady state skips
         # this without touching the device; *which* rows need it stays a GPU-side mask select.
         if not self._window_all_primed:
@@ -441,14 +446,15 @@ class SonicWholeBodyAction(ActionTerm):
         num_envs = window.shape[0]
 
         smpl_joints = window[:, :, SonicReferenceSlice.SMPL_JOINTS].reshape(
-            num_envs, SONIC_HISTORY_LENGTH, 24, 3
+            num_envs, self._reference_frames, 24, 3
         )
         root_quat = window[:, :, SonicReferenceSlice.ROOT_QUAT]
         wrist = window[:, :, SonicReferenceSlice.WRIST_JOINT_POS]
 
-        anchor_ori = smpl_anchor_orientation_heading(
+        anchor_ori = smpl_anchor_orientation(
             reference_root_quat=root_quat,
             robot_base_quat=isaaclab_quat_to_wxyz(self._asset.data.root_quat_w.torch),
             apply_delta_heading=self._apply_delta_heading,
+            orientation_mode=self._policy.variant.orientation_mode,
         )
         return self._policy.fill_smpl_encoder_obs(smpl_joints, anchor_ori, wrist)

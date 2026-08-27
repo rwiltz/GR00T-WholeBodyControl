@@ -83,18 +83,26 @@ the SONIC stream on entry and back on exit using CUDA events -- asynchronous in 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import pathlib
 
 import numpy as np
 import torch
 
 __all__ = [
+    "ORIENTATION_MODE_BODY",
+    "ORIENTATION_MODE_HEADING",
     "SONIC_DECODER_INPUT_DIM",
     "SONIC_ENCODER_INPUT_DIM",
     "SONIC_NUM_ACTIONS",
     "SONIC_TOKEN_DIM",
+    "SONIC_VARIANTS_BY_ENCODER_DIM",
+    "SONIC_VARIANT_LOW_LATENCY",
+    "SONIC_VARIANT_V1_1",
     "SmplEncoderSlots",
     "SonicOnnxPolicy",
+    "SonicVariant",
+    "smpl_anchor_orientation",
     "smpl_anchor_orientation_heading",
 ]
 
@@ -110,7 +118,11 @@ ENCODER_MODE_SMPL = 2
 
 
 class SmplEncoderSlots:
-    """Slices of the encoder input that ``smpl`` mode populates."""
+    """Slices of the SONIC v1.1 encoder input that ``smpl`` mode populates.
+
+    Retained as the v1.1 layout for external callers. The runtime uses
+    :attr:`SonicVariant.smpl_joints` and friends, which vary per checkpoint.
+    """
 
     MODE_ID = slice(0, 1)
     ENCODER_INDEX = slice(1, 4)
@@ -119,46 +131,166 @@ class SmplEncoderSlots:
     WRIST_JOINT_POS = slice(1691, 1751)  # 10 frames x 6
 
 
-def smpl_anchor_orientation_heading(
+#: Orientation modes from ``GatherMotionAnchorOrientationMutiFrame``
+#: (``g1_deploy_onnx_ref.cpp:607-610``). These select the *left* quaternion of the relative
+#: rotation ``conj(left) * (apply_delta_heading * reference_root_quat)``.
+ORIENTATION_MODE_BODY = 0
+"""Full base quaternion (``motion_anchor_ori_b``). The robot's pitch and roll enter the term."""
+ORIENTATION_MODE_HEADING = 1
+"""Robot heading (yaw) only (``motion_anchor_ori_heading``). Invariant to operator turning."""
+
+
+@dataclasses.dataclass(frozen=True)
+class SonicVariant:
+    """Per-checkpoint encoder geometry and reference semantics.
+
+    Two SONIC checkpoints ship with this repo and they differ by more than a window length, so
+    the differences are captured in one place rather than scattered through the action term.
+
+    ============================  ===============  ==================
+    field                         ``sonic_v1_1``   ``low_latency``
+    ============================  ===============  ==================
+    encoder input                 1751             1247
+    reference frames              10               4
+    anchor orientation            heading (yaw)    body (full quat)
+    decoder input / proprio       994 / 10 frames  994 / 10 frames
+    ============================  ===============  ==================
+
+    The layouts were recovered from each encoder graph's ``Slice`` nodes, which slice the input
+    after the mode id is gathered off the front -- hence the uniform ``+1`` against the raw graph
+    offsets. Note the decoder is identical across both, so the **proprioception history stays 10
+    frames either way**; only the *reference* window shortens.
+
+    Attributes:
+        name: Checkpoint directory name, used in messages.
+        encoder_input_dim: Width of the encoder graph's single input.
+        reference_frames: Reference frames the ``smpl`` encoder consumes. This is the induced
+            operator latency in control steps: 10 frames at 50 Hz trails by ~200 ms, 4 by ~80 ms.
+        smpl_joints: Slice holding ``reference_frames x 24 x 3`` root-local joint positions.
+        smpl_anchor_ori: Slice holding ``reference_frames x 6`` rotations.
+        wrist_joint_pos: Slice holding ``reference_frames x 6`` wrist angles.
+        orientation_mode: One of :data:`ORIENTATION_MODE_BODY` / :data:`ORIENTATION_MODE_HEADING`.
+    """
+
+    name: str
+    encoder_input_dim: int
+    reference_frames: int
+    smpl_joints: slice
+    smpl_anchor_ori: slice
+    wrist_joint_pos: slice
+    orientation_mode: int
+
+
+SONIC_VARIANT_V1_1 = SonicVariant(
+    name="sonic_v1_1",
+    encoder_input_dim=1751,
+    reference_frames=10,
+    smpl_joints=slice(911, 1631),
+    smpl_anchor_ori=slice(1631, 1691),
+    wrist_joint_pos=slice(1691, 1751),
+    orientation_mode=ORIENTATION_MODE_HEADING,
+)
+
+SONIC_VARIANT_LOW_LATENCY = SonicVariant(
+    name="low_latency",
+    encoder_input_dim=1247,
+    reference_frames=4,
+    smpl_joints=slice(911, 1199),
+    smpl_anchor_ori=slice(1199, 1223),
+    wrist_joint_pos=slice(1223, 1247),
+    orientation_mode=ORIENTATION_MODE_BODY,
+)
+
+#: Keyed by encoder input width so the variant is read off the graph itself. Selecting on the
+#: directory name instead would silently mismatch if a checkpoint were moved or renamed.
+SONIC_VARIANTS_BY_ENCODER_DIM = {
+    variant.encoder_input_dim: variant
+    for variant in (SONIC_VARIANT_V1_1, SONIC_VARIANT_LOW_LATENCY)
+}
+
+
+def smpl_anchor_orientation(
     reference_root_quat: torch.Tensor,
     robot_base_quat: torch.Tensor,
     apply_delta_heading: torch.Tensor,
+    orientation_mode: int = ORIENTATION_MODE_HEADING,
 ) -> torch.Tensor:
-    """Reference root orientation expressed relative to the robot's own heading, as 6D rotation.
+    """Reference root orientation relative to the robot, as a 6D rotation.
 
-    Reproduces ``GatherMotionAnchorOrientationMutiFrame`` with ``orientation_mode == 1``
-    (``g1_deploy_onnx_ref.cpp:612-691``), which is what SONIC v1.1 uses::
+    Reproduces ``GatherMotionAnchorOrientationMutiFrame``
+    (``g1_deploy_onnx_ref.cpp:612-691``)::
 
-        base_to_ref = conj(heading(robot_base_quat)) * (apply_delta_heading * reference_root_quat)
+        base_to_ref = conj(left) * (apply_delta_heading * reference_root_quat)
 
-    Taking only the robot's *yaw* makes the reference invariant to which way the operator has
-    turned, so operator yaw drift does not accumulate. The operator's pitch and roll stay absolute.
+    where ``left`` is selected by ``orientation_mode``:
+
+    * :data:`ORIENTATION_MODE_HEADING` -- ``heading(robot_base_quat)``, the robot's *yaw* only.
+      Used by SONIC v1.1. Makes the reference invariant to which way the operator has turned, so
+      operator yaw drift does not accumulate; the operator's pitch and roll stay absolute.
+    * :data:`ORIENTATION_MODE_BODY` -- the full ``robot_base_quat``. Used by the low-latency
+      checkpoint (``motion_anchor_ori_b``). The robot's own pitch and roll now enter the term, so
+      the reference is expressed in the tilted body frame rather than a level heading frame.
+
+    Picking the wrong mode is a silent failure: both produce a well-formed rotation, and the
+    resulting 6D term stays in range, so it degrades control quality rather than raising.
 
     Args:
         reference_root_quat: ``(N, F, 4)`` wxyz reference root orientations.
         robot_base_quat: ``(N, 4)`` wxyz robot base orientation.
         apply_delta_heading: ``(N, 4)`` wxyz operator/robot heading alignment latched at engage.
+        orientation_mode: See above.
 
     Returns:
         ``(N, F, 6)`` first two columns of each rotation matrix, flattened per frame.
+
+    Raises:
+        ValueError: If ``orientation_mode`` is not a supported mode.
     """
     from gear_sonic.isaac_utils.rotations import (
         calc_heading_quat_inv,
+        quat_conjugate,
         quat_mul,
         quaternion_to_matrix,
     )
 
     num_frames = reference_root_quat.shape[1]
-    heading_inv = calc_heading_quat_inv(robot_base_quat, w_last=False)
-    heading_inv = heading_inv.unsqueeze(1).expand(-1, num_frames, -1)
+    if orientation_mode == ORIENTATION_MODE_HEADING:
+        left_inv = calc_heading_quat_inv(robot_base_quat, w_last=False)
+    elif orientation_mode == ORIENTATION_MODE_BODY:
+        left_inv = quat_conjugate(robot_base_quat, w_last=False)
+    else:
+        raise ValueError(
+            f"Unsupported orientation_mode {orientation_mode}; expected "
+            f"{ORIENTATION_MODE_BODY} (body) or {ORIENTATION_MODE_HEADING} (heading). "
+            "Mode 2 (reference first-frame heading) is not used by any shipped checkpoint."
+        )
+    left_inv = left_inv.unsqueeze(1).expand(-1, num_frames, -1)
     delta = apply_delta_heading.unsqueeze(1).expand(-1, num_frames, -1)
 
     aligned = quat_mul(delta, reference_root_quat, w_last=False)
-    base_to_ref = quat_mul(heading_inv, aligned, w_last=False)
+    base_to_ref = quat_mul(left_inv, aligned, w_last=False)
 
     matrices = quaternion_to_matrix(base_to_ref.reshape(-1, 4))
     six_d = matrices[..., :2].reshape(base_to_ref.shape[0], num_frames, 6)
     return six_d
+
+
+def smpl_anchor_orientation_heading(
+    reference_root_quat: torch.Tensor,
+    robot_base_quat: torch.Tensor,
+    apply_delta_heading: torch.Tensor,
+) -> torch.Tensor:
+    """Heading-normalized anchor orientation, i.e. SONIC v1.1 semantics.
+
+    Thin wrapper over :func:`smpl_anchor_orientation` with
+    :data:`ORIENTATION_MODE_HEADING`, kept as the original entry point.
+    """
+    return smpl_anchor_orientation(
+        reference_root_quat,
+        robot_base_quat,
+        apply_delta_heading,
+        orientation_mode=ORIENTATION_MODE_HEADING,
+    )
 
 
 class SonicOnnxPolicy:
@@ -224,6 +356,7 @@ class SonicOnnxPolicy:
         self._encoder = ort.InferenceSession(str(encoder_path), options, providers=providers)
         self._decoder = ort.InferenceSession(str(decoder_path), options, providers=providers)
         self.providers = self._encoder.get_providers()
+        self.variant = self._resolve_variant(self._encoder)
         self._encoder_input = self._encoder.get_inputs()[0].name
         self._decoder_input = self._decoder.get_inputs()[0].name
         self._encoder_output = self._encoder.get_outputs()[0].name
@@ -247,6 +380,29 @@ class SonicOnnxPolicy:
         if self._gpu_resident:
             self._init_bindings()
 
+    @staticmethod
+    def _resolve_variant(encoder_session) -> SonicVariant:
+        """Identify the checkpoint from its encoder input width.
+
+        Reading the graph is authoritative: the same directory name could hold a re-export, and a
+        mismatched layout would corrupt the ``smpl`` slots without raising.
+
+        Raises:
+            ValueError: If the width matches no known checkpoint.
+        """
+        width = encoder_session.get_inputs()[0].shape[-1]
+        variant = SONIC_VARIANTS_BY_ENCODER_DIM.get(width)
+        if variant is None:
+            known = ", ".join(
+                f"{v.encoder_input_dim} ({v.name})" for v in SONIC_VARIANTS_BY_ENCODER_DIM.values()
+            )
+            raise ValueError(
+                f"Unrecognised SONIC encoder input width {width}. Known checkpoints: {known}. "
+                "A new export needs a SonicVariant entry describing its smpl slot layout and "
+                "anchor orientation mode."
+            )
+        return variant
+
     def _init_buffers(self) -> None:
         """Preallocate every fixed-shape tensor the control loop touches.
 
@@ -255,7 +411,7 @@ class SonicOnnxPolicy:
         vector nor ships a constant from host to device.
         """
         alloc = dict(device=self.device, dtype=torch.float32)
-        self.encoder_obs = torch.zeros(self.BATCH, SONIC_ENCODER_INPUT_DIM, **alloc)
+        self.encoder_obs = torch.zeros(self.BATCH, self.variant.encoder_input_dim, **alloc)
         self.latent = torch.zeros(self.BATCH, SONIC_TOKEN_DIM, **alloc)
         self.decoder_obs = torch.zeros(self.BATCH, SONIC_DECODER_INPUT_DIM, **alloc)
         self.action = torch.zeros(self.BATCH, SONIC_NUM_ACTIONS, **alloc)
@@ -376,10 +532,10 @@ class SonicOnnxPolicy:
             ``(1, 64)`` motion token. On CUDA this is :attr:`latent`, a persistent buffer that is
             overwritten by the next call -- clone it if you need to retain it.
         """
-        if encoder_obs.shape[-1] != SONIC_ENCODER_INPUT_DIM:
+        if encoder_obs.shape[-1] != self.variant.encoder_input_dim:
             raise ValueError(
-                f"encoder input must be {SONIC_ENCODER_INPUT_DIM}-wide, "
-                f"got {encoder_obs.shape[-1]}"
+                f"encoder input must be {self.variant.encoder_input_dim}-wide for the "
+                f"{self.variant.name} checkpoint, got {encoder_obs.shape[-1]}"
             )
         self._check_batch(encoder_obs, "encoder_obs")
         if not self._gpu_resident:
@@ -445,9 +601,10 @@ class SonicOnnxPolicy:
         self._check_batch(smpl_joints, "smpl_joints")
         obs = self.encoder_obs
         batch = obs.shape[0]
-        obs[:, SmplEncoderSlots.SMPL_JOINTS] = smpl_joints.reshape(batch, -1)
-        obs[:, SmplEncoderSlots.SMPL_ANCHOR_ORI] = anchor_ori_6d.reshape(batch, -1)
-        obs[:, SmplEncoderSlots.WRIST_JOINT_POS] = wrist_joint_pos.reshape(batch, -1)
+        variant = self.variant
+        obs[:, variant.smpl_joints] = smpl_joints.reshape(batch, -1)
+        obs[:, variant.smpl_anchor_ori] = anchor_ori_6d.reshape(batch, -1)
+        obs[:, variant.wrist_joint_pos] = wrist_joint_pos.reshape(batch, -1)
         return obs
 
     @staticmethod

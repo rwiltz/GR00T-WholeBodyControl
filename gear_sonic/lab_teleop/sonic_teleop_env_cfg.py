@@ -44,9 +44,13 @@ from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
 __all__ = [
     "ANCHOR_ROT_YAW_RIGHT_90",
     "DEFAULT_CHECKPOINT_DIR",
+    "LOW_LATENCY_CHECKPOINT_DIR",
     "PELVIS_ANCHOR_Z_OFFSET",
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
+    "SonicTeleopG1LowLatencyEnvCfg",
+    "SonicTeleopG1LowLatencyReplayEnvCfg",
+    "SonicTeleopG1ReplayEnvCfg",
 ]
 
 #: XR anchor yaw, as an XYZW quaternion: -90 deg about +Z, i.e. rotated 90 deg to the right.
@@ -79,9 +83,16 @@ PELVIS_ANCHOR_Z_OFFSET = -0.95
 SONIC_G1_PELVIS_PRIM = "/World/envs/env_0/Robot/Geometry/pelvis"
 
 #: Where ``download_from_hf.py --sonic-v1-1`` puts the deployment ONNX graphs.
-DEFAULT_CHECKPOINT_DIR = str(
-    repo_root() / "gear_sonic_deploy" / "policy" / "sonic_v1_1"
-)
+DEFAULT_CHECKPOINT_DIR = str(repo_root() / "gear_sonic_deploy" / "policy" / "sonic_v1_1")
+
+#: Where ``download_from_hf.py --low-latency`` puts the low-latency ONNX graphs.
+#:
+#: This checkpoint shortens the ``smpl`` reference window from 10 frames to 4, cutting the
+#: operator-to-robot lag from ~200 ms to ~80 ms at the 50 Hz control rate. It also switches the
+#: anchor orientation from heading-normalized to body-frame; both differences are described by
+#: :class:`~gear_sonic.lab_teleop.mdp.sonic_policy.SonicVariant` and applied automatically, since
+#: the action term reads them off the encoder graph.
+LOW_LATENCY_CHECKPOINT_DIR = str(repo_root() / "gear_sonic_deploy" / "policy" / "low_latency")
 
 
 @configclass
@@ -90,9 +101,7 @@ class SonicTeleopSceneCfg(InteractiveSceneCfg):
 
     # ``visible=False`` hides the plane from the renderer but still spawns the collider, so the
     # robot has something to stand on. Dropping the asset entirely would let it fall through.
-    ground = AssetBaseCfg(
-        prim_path="/World/GroundPlane", spawn=GroundPlaneCfg(visible=False)
-    )
+    ground = AssetBaseCfg(prim_path="/World/GroundPlane", spawn=GroundPlaneCfg(visible=False))
 
     light = AssetBaseCfg(
         prim_path="/World/Light",
@@ -258,6 +267,60 @@ class SonicTeleopG1ReplayEnvCfg(SonicTeleopG1EnvCfg):
     fast instead. This variant therefore swaps in the vendor-less pipeline builder.
 
     Use with ``scripts/environments/teleoperation/teleop_replay_agent.py --replay_file <mcap>``.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters import (
+            build_sonic_fullbody_replay_pipeline,
+        )
+
+        self.isaac_teleop.pipeline_builder = build_sonic_fullbody_replay_pipeline
+
+
+@configclass
+class SonicTeleopG1LowLatencyEnvCfg(SonicTeleopG1EnvCfg):
+    """Live-headset environment driven by the **low-latency** SONIC checkpoint.
+
+    Identical scene, actuation and teleop wiring to :class:`SonicTeleopG1EnvCfg`; only the
+    checkpoint changes. Everything downstream adapts automatically because
+    :class:`~gear_sonic.lab_teleop.mdp.sonic_policy.SonicOnnxPolicy` identifies the checkpoint from
+    its encoder input width and exposes a
+    :class:`~gear_sonic.lab_teleop.mdp.sonic_policy.SonicVariant` describing it.
+
+    Two things differ from ``sonic_v1_1`` and both are handled by that variant:
+
+    * **4 reference frames instead of 10.** The encoder input narrows from 1751 to 1247, and the
+      robot trails the operator by ~80 ms rather than ~200 ms at the 50 Hz control rate. The
+      *decoder* is unchanged at 994, so the proprioception history is still 10 frames.
+    * **Body-frame anchor orientation instead of heading-normalized.** The relative rotation uses
+      the full base quaternion rather than the robot's yaw alone, so the robot's own pitch and
+      roll now enter the reference term.
+
+    That second difference is why this is a distinct config rather than a ``checkpoint_dir``
+    override on the base class: applying v1.1's heading-normalized math to this checkpoint would
+    produce a well-formed but wrong rotation, degrading control silently rather than raising.
+
+    Fetch the checkpoint with ``python download_from_hf.py --low-latency``.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.actions.sonic.checkpoint_dir = LOW_LATENCY_CHECKPOINT_DIR
+
+
+@configclass
+class SonicTeleopG1LowLatencyReplayEnvCfg(SonicTeleopG1LowLatencyEnvCfg):
+    """Low-latency environment wired for MCAP replay instead of a live headset.
+
+    Stands in the same relation to :class:`SonicTeleopG1LowLatencyEnvCfg` as
+    :class:`SonicTeleopG1ReplayEnvCfg` does to :class:`SonicTeleopG1EnvCfg`: it swaps in the
+    vendor-less pipeline that ``SessionMode.REPLAY`` requires (see that class for why).
+
+    A capture recorded against either checkpoint replays here -- the MCAP holds raw tracker
+    streams, not encoder inputs, so the reference window is rebuilt at replay time from whatever
+    the active checkpoint asks for.
     """
 
     def __post_init__(self) -> None:

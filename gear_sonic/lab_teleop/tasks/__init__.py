@@ -28,13 +28,19 @@ SONIC_TELEOP_G1_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-v0"
 SONIC_TELEOP_G1_REPLAY_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-Replay-v0"
 """MCAP-replay id. Same environment with the vendor-less pipeline REPLAY sessions require."""
 
+SONIC_TELEOP_G1_LOW_LATENCY_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-LowLatency-v0"
+"""Live-headset id running the low-latency checkpoint (4 reference frames, ~80 ms lag)."""
+
+SONIC_TELEOP_G1_LOW_LATENCY_REPLAY_TASK_ID = (
+    "IsaacContrib-Teleop-Sonic-WholeBody-G1-LowLatency-Replay-v0"
+)
+"""MCAP-replay id for the low-latency checkpoint."""
+
 gym.register(
     id=SONIC_TELEOP_G1_TASK_ID,
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1EnvCfg"
-        ),
+        "env_cfg_entry_point": ("gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1EnvCfg"),
     },
     disable_env_checker=True,
 )
@@ -50,4 +56,31 @@ gym.register(
     disable_env_checker=True,
 )
 
-__all__ = ["SONIC_TELEOP_G1_REPLAY_TASK_ID", "SONIC_TELEOP_G1_TASK_ID"]
+gym.register(
+    id=SONIC_TELEOP_G1_LOW_LATENCY_TASK_ID,
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1LowLatencyEnvCfg"
+        ),
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id=SONIC_TELEOP_G1_LOW_LATENCY_REPLAY_TASK_ID,
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:" "SonicTeleopG1LowLatencyReplayEnvCfg"
+        ),
+    },
+    disable_env_checker=True,
+)
+
+__all__ = [
+    "SONIC_TELEOP_G1_LOW_LATENCY_REPLAY_TASK_ID",
+    "SONIC_TELEOP_G1_LOW_LATENCY_TASK_ID",
+    "SONIC_TELEOP_G1_REPLAY_TASK_ID",
+    "SONIC_TELEOP_G1_TASK_ID",
+]
