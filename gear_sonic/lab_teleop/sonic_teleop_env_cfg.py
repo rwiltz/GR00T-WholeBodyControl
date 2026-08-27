@@ -32,6 +32,7 @@ from isaaclab.scene import InteractiveSceneCfg
 import isaaclab.sim as sim_utils
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
+from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
 from isaaclab.utils.configclass import configclass
 
 from gear_sonic.lab_teleop.assets import (
@@ -39,6 +40,8 @@ from gear_sonic.lab_teleop.assets import (
     make_g1_sonic_cfg,
     repo_root,
 )
+from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+from gear_sonic.lab_teleop.assets.g1_sonic import G1_HAND_JOINT_NAMES
 from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
 
 __all__ = [
@@ -48,6 +51,10 @@ __all__ = [
     "PELVIS_ANCHOR_Z_OFFSET",
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
+    "SonicTeleopG1HandsEnvCfg",
+    "SonicTeleopG1HandsLowLatencyEnvCfg",
+    "SonicTeleopG1HandsLowLatencyReplayEnvCfg",
+    "SonicTeleopG1HandsReplayEnvCfg",
     "SonicTeleopG1LowLatencyEnvCfg",
     "SonicTeleopG1LowLatencyReplayEnvCfg",
     "SonicTeleopG1ReplayEnvCfg",
@@ -115,10 +122,12 @@ class SonicTeleopSceneCfg(InteractiveSceneCfg):
 class SonicActionsCfg:
     """SONIC is the only action term; it drives all 29 joints."""
 
+    # Named explicitly rather than ".*": the articulation is 43 DoF since the URDF's 14 finger
+    # joints were un-welded for hand teleoperation, and SONIC drives only its own 29.
     sonic = SonicWholeBodyActionCfg(
         asset_name="robot",
         checkpoint_dir=DEFAULT_CHECKPOINT_DIR,
-        joint_names=[".*"],
+        joint_names=list(G1_ISAACLab_ORDER),
         action_scale=G1_MODEL_12_ACTION_SCALE,
     )
 
@@ -331,6 +340,100 @@ class SonicTeleopG1LowLatencyReplayEnvCfg(SonicTeleopG1LowLatencyEnvCfg):
         )
 
         self.isaac_teleop.pipeline_builder = build_sonic_fullbody_replay_pipeline
+
+
+@configclass
+class SonicHandsActionsCfg(SonicActionsCfg):
+    """SONIC body plus controller-driven hands.
+
+    Term order fixes the action layout, because ``ActionManager`` concatenates terms in
+    declaration order: ``[sonic_reference(83) | hands(14)]`` == 97. The pipeline's
+    ``TensorReorderer`` emits the same order.
+    """
+
+    hands = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=list(G1_HAND_JOINT_NAMES),
+        scale=1.0,
+        use_default_offset=False,
+        preserve_order=True,
+    )
+
+
+@configclass
+class SonicTeleopG1HandsEnvCfg(SonicTeleopG1EnvCfg):
+    """SONIC whole-body teleoperation with tri-hand controller grasping.
+
+    Adds a second action term for the 14 finger joints, driven from the motion controllers:
+    **trigger** closes index and thumb (pinch), **squeeze** closes middle and thumb (grasp).
+
+    The finger joints ship welded in ``main.urdf`` and are un-welded in this repo, so the
+    articulation is 43 DoF. SONIC still drives exactly its own 29 -- see
+    :class:`SonicActionsCfg` -- and the hands are an independent term, mirroring how
+    ``locomanip_pick_place`` separates body and hand control.
+
+    Action layout is ``[sonic_reference(83) | left_hand(7) | right_hand(7)]`` == 97.
+    """
+
+    actions: SonicHandsActionsCfg = SonicHandsActionsCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_hands_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder()
+
+
+@configclass
+class SonicTeleopG1HandsReplayEnvCfg(SonicTeleopG1HandsEnvCfg):
+    """Hands variant wired for MCAP replay.
+
+    A capture recorded with controller channels replays its trigger/squeeze values here. Note the
+    existing full-body captures do carry ``controllers/*`` channels, which nothing consumed before
+    this pipeline existed.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_hands_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder(vendor=None)
+
+
+@configclass
+class SonicTeleopG1HandsLowLatencyEnvCfg(SonicTeleopG1HandsEnvCfg):
+    """Hands variant running the **low-latency** SONIC checkpoint.
+
+    Hand control is independent of the SONIC checkpoint: fingers are driven from the motion
+    controllers through their own action term, while SONIC drives the 29 body joints. Swapping the
+    checkpoint therefore only changes the body controller -- the 4-frame reference window and
+    body-frame anchor orientation are picked up automatically from the encoder graph (see
+    :class:`~gear_sonic.lab_teleop.mdp.sonic_policy.SonicVariant`).
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.actions.sonic.checkpoint_dir = LOW_LATENCY_CHECKPOINT_DIR
+
+
+@configclass
+class SonicTeleopG1HandsLowLatencyReplayEnvCfg(SonicTeleopG1HandsLowLatencyEnvCfg):
+    """Low-latency hands variant wired for MCAP replay."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_hands_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder(vendor=None)
 
 
 def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:

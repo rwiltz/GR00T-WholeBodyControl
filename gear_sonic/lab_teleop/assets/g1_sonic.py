@@ -37,6 +37,7 @@ from __future__ import annotations
 import copy
 import pathlib
 
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
 from gear_sonic.envs.manager_env.robots.g1 import (
@@ -48,6 +49,7 @@ from gear_sonic.envs.manager_env.robots.g1 import (
 )
 
 __all__ = [
+    "G1_HAND_JOINT_NAMES",
     "G1_ISAACLAB_TO_MUJOCO_MAPPING",
     "G1_MODEL_12_ACTION_SCALE",
     "G1_SONIC_CFG",
@@ -58,7 +60,9 @@ __all__ = [
 # gear_sonic/lab_teleop/assets/g1_sonic.py -> repo root is 4 levels up.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
-#: SONIC's G1 is 29 DoF (no hand joints in ``robot_description/urdf/g1/main.urdf``).
+#: Body joints SONIC drives. The articulation itself is 43 DoF: the URDF's 14 finger joints were
+#: shipped welded (``type="fixed"``) and are now un-welded for hand teleoperation, so SONIC must
+#: name its joints explicitly rather than matching ``.*``.
 SONIC_NUM_JOINTS = 29
 
 
@@ -109,28 +113,98 @@ def _set_ros_package_paths(cfg: ArticulationCfg) -> None:
             f"Expected the 'robot_description' package at {package_dir}. "
             "If this repo was cloned without Git LFS, run 'git lfs pull'."
         )
-    cfg.spawn.ros_package_paths = [
-        {"name": package_dir.name, "path": str(package_dir)}
-    ]
+    cfg.spawn.ros_package_paths = [{"name": package_dir.name, "path": str(package_dir)}]
+
+
+#: Hand joints, 7 per side, in the order
+#: :class:`~isaacteleop.retargeters.TriHandMotionControllerRetargeter` emits them:
+#: ``[thumb_rotation, thumb_proximal, thumb_distal, index_proximal, index_distal,
+#: middle_proximal, middle_distal]``.
+G1_HAND_JOINT_NAMES: tuple[str, ...] = tuple(
+    f"{side}_hand_{finger}_{index}_joint"
+    for side in ("left", "right")
+    for finger, index in (
+        ("thumb", 0),
+        ("thumb", 1),
+        ("thumb", 2),
+        ("index", 0),
+        ("index", 1),
+        ("middle", 0),
+        ("middle", 1),
+    )
+)
+
+
+def _add_hand_actuators(cfg: ArticulationCfg) -> None:
+    """Give the 14 finger joints an actuator group.
+
+    The URDF ships these joints welded (``type="fixed"``) but fully specified -- axis, effort,
+    velocity and travel limits are all present -- so un-welding them yields real DoFs with no
+    other asset change. Isaac Lab requires every articulated joint to be covered by some
+    actuator, so an uncovered finger would fail at startup rather than simply going limp.
+
+    Gains are deliberately stiff relative to the body: fingers are light, carry no load in this
+    scene, and a soft grip visibly lags the trigger. Effort and velocity are taken from the URDF
+    rather than invented.
+    """
+    if any("hand" in name for name in cfg.actuators):
+        return
+    cfg.actuators["hands"] = ImplicitActuatorCfg(
+        joint_names_expr=[".*_hand_(thumb|index|middle)_[0-2]_joint"],
+        effort_limit=1.4,
+        velocity_limit=12.0,
+        stiffness=20.0,
+        damping=1.0,
+    )
 
 
 def _set_usd_cache_dir(cfg: ArticulationCfg) -> None:
-    """Give the URDF converter a stable output directory so conversion happens once.
+    """Give the URDF converter a stable, **content-addressed** output directory.
 
     ``UrdfConverterCfg.usd_dir`` defaults to ``None``, and the converter then writes to
-    ``<tmp>/IsaacLab/usd_<timestamp>_<random>`` (``asset_converter_base.py:74``). The name is
-    different on every launch, so the "lazy conversion" the converter documents can never hit:
-    each run re-imports all 68 STL meshes (~66 MB) from scratch and leaves the output behind. A
-    session of a dozen launches accumulated 63 such directories totalling 515 MB here.
+    ``<tmp>/IsaacLab/usd_<timestamp>_<random>`` (``asset_converter_base.py:74``). The name differs
+    every launch, so the converter's lazy-conversion check can never hit and each run re-imports
+    all 68 STL meshes (~66 MB) from scratch, leaving the output behind.
 
-    Pointing at a fixed directory lets the converter's own staleness check do its job -- it
-    re-converts only when the asset path, converter settings or source file actually change, so
-    edits to ``main.urdf`` are still picked up. ``.cache/`` is already git-ignored.
+    A *fixed* directory is not sufficient on its own, and getting this wrong is dangerous rather
+    than merely wasteful. The URDF importer names its output after the source stem and
+    **increments** instead of overwriting, so a changed asset produces ``main_1``, ``main_2``, ...
+    alongside the original while the loader may still resolve the stale ``main``. That silently
+    simulates the *old* robot: un-welding the hand joints produced a 43-DoF ``main_3`` while the
+    articulation loaded 29 DoF from ``main``, and the only symptom was an actuator regex matching
+    nothing.
+
+    Addressing the directory by a digest of the asset and the converter settings that affect its
+    output means one directory only ever holds one conversion:
+
+    * unchanged asset -> same directory -> genuine reuse (measured 6.0 s cold, 4.1 s warm, with no
+      new directories created across repeated runs);
+    * changed asset -> different directory -> fresh conversion, and the previous one can no longer
+      be selected.
+
+    Superseded digests are inert and safe to delete; they are not pruned automatically because
+    doing so would race a concurrently starting run. Disk is now bounded by the number of asset
+    revisions (~11 MB each) rather than by the number of launches.
     """
-    usd_dir = _REPO_ROOT / ".cache" / "urdf_usd" / "g1"
+    import hashlib
+
+    asset_path = pathlib.Path(cfg.spawn.asset_path)
+    digest = hashlib.sha256()
+    digest.update(asset_path.read_bytes())
+    # Converter settings that change the emitted USD. Folded in so a settings change also lands in
+    # a fresh directory rather than incrementing inside an existing one.
+    for field in (
+        "merge_fixed_joints",
+        "fix_base",
+        "convert_mimic_joints_to_normal_joints",
+        "replace_cylinders_with_capsules",
+        "joint_drive",
+    ):
+        digest.update(repr(getattr(cfg.spawn, field, None)).encode())
+
+    usd_dir = _REPO_ROOT / ".cache" / "urdf_usd" / f"g1-{digest.hexdigest()[:16]}"
     usd_dir.mkdir(parents=True, exist_ok=True)
     cfg.spawn.usd_dir = str(usd_dir)
-    cfg.spawn.usd_file_name = "g1_sonic.usd"
 
 
 def _migrate_deprecated_actuator_limits(cfg: ArticulationCfg) -> None:
@@ -166,6 +240,7 @@ def make_g1_sonic_cfg(prim_path: str = "{ENV_REGEX_NS}/Robot") -> ArticulationCf
     cfg = copy.deepcopy(_UPSTREAM_CFG)
     _absolutize_asset_path(cfg)
     _set_ros_package_paths(cfg)
+    _add_hand_actuators(cfg)
     _set_usd_cache_dir(cfg)
     _migrate_deprecated_actuator_limits(cfg)
     return cfg.replace(prim_path=prim_path)
