@@ -33,7 +33,8 @@ Terms outside the active mode stay zero; the deploy stack does the same rather t
 
 .. note::
    Both graphs are exported with a **fixed batch size of 1**, so this runner drives a single
-   environment. Multi-env rollouts would need a re-export with a dynamic batch axis.
+   environment. Multi-env rollouts would need a re-export with a dynamic batch axis. The batch
+   width is validated explicitly here rather than left to fail inside onnxruntime.
 
 GPU execution
 -------------
@@ -51,10 +52,37 @@ back to CPU *silently*, so :class:`SonicOnnxPolicy` warns explicitly instead.
 This module imports ``torch`` at module scope on purpose: doing so loads torch's bundled CUDA
 libraries into the process, which is what lets onnxruntime's CUDA provider resolve
 ``libcublasLt.so.12`` and friends without a hand-set ``LD_LIBRARY_PATH``.
+
+Zero-copy GPU I/O
+-----------------
+On CUDA the runner keeps every tensor resident on the device. Inputs and outputs are preallocated
+torch CUDA tensors, and onnxruntime reads and writes those exact allocations through a persistent
+``IOBinding`` created once at construction and reused every control step::
+
+    torch CUDA encoder obs -> ORT encoder -> 64-D latent (torch CUDA)
+                           -> ORT decoder -> 29-D action (torch CUDA)
+
+Binding is by raw ``data_ptr()``, so no DLPack capsule is built per frame and no host memory is
+touched. The alternative -- ``.cpu().numpy()`` in, ``torch.from_numpy().to(cuda)`` out -- forced a
+full device synchronize twice per control step, because copying to host must wait for all prior
+GPU work to retire.
+
+Stream ownership
+~~~~~~~~~~~~~~~~
+onnxruntime runs on its own CUDA stream by default, which would race against torch writes into the
+bound input buffers. We therefore create one dedicated torch stream and hand its handle to the CUDA
+provider via ``user_compute_stream``, so torch and ORT issue into the *same* stream and ordering is
+implicit -- no events, no host synchronization.
+
+Torch's default stream cannot be used for this: its handle is the null pointer, which the provider
+treats as "unset" (it silently reports ``has_user_compute_stream: 0``). Callers therefore run their
+own tensor work inside :meth:`SonicOnnxPolicy.compute_stream`, which joins the caller's stream to
+the SONIC stream on entry and back on exit using CUDA events -- asynchronous in both directions.
 """
 
 from __future__ import annotations
 
+import contextlib
 import pathlib
 
 import numpy as np
@@ -134,19 +162,28 @@ def smpl_anchor_orientation_heading(
 
 
 class SonicOnnxPolicy:
-    """Runs the SONIC encoder and decoder ONNX graphs.
+    """Runs the SONIC encoder and decoder ONNX graphs, GPU-resident where possible.
+
+    On CUDA, inference is zero-copy: the caller writes into :attr:`encoder_obs`, and results land
+    in :attr:`latent` and :attr:`action`, all of which are persistent torch CUDA tensors bound to
+    onnxruntime once at construction. On CPU the runner falls back to the numpy path, which is
+    correct but slow enough that teleoperation will not hold 50 Hz.
 
     Args:
         checkpoint_dir: Directory holding ``model_encoder.onnx`` and ``model_decoder.onnx``
             (e.g. ``gear_sonic_deploy/policy/sonic_v1_1``).
-        device: Torch device the caller's tensors live on. Used to move results back.
+        device: Torch device the caller's tensors live on.
         providers: Explicit onnxruntime execution providers. Defaults to CUDA then CPU.
 
     Example:
         >>> policy = SonicOnnxPolicy("gear_sonic_deploy/policy/sonic_v1_1", device="cuda:0")
-        >>> token = policy.encode(encoder_obs)      # (1, 1751) -> (1, 64)
-        >>> action = policy.decode(token, proprio)  # (1, 64) + (1, 930) -> (1, 29)
+        >>> with policy.compute_stream():
+        ...     token = policy.encode(encoder_obs)      # (1, 1751) -> (1, 64)
+        ...     action = policy.decode(token, proprio)  # (1, 64) + (1, 930) -> (1, 29)
     """
+
+    #: The shipped graphs are exported with a static batch axis.
+    BATCH = 1
 
     def __init__(
         self,
@@ -168,8 +205,19 @@ class SonicOnnxPolicy:
                 )
 
         self.device = torch.device(device)
+        self._is_cuda = self.device.type == "cuda"
+        if self._is_cuda and self.device.index is None:
+            # A bare "cuda" must be pinned to a concrete ordinal before anything derives an ORT
+            # ``device_id`` from it. Torch would allocate on the *current* device while ORT would
+            # default to 0, silently splitting the two across GPUs on a multi-GPU host.
+            self.device = torch.device("cuda", torch.cuda.current_device())
+
+        # A dedicated stream shared with ORT. Created before the sessions because its handle is a
+        # provider option. See the module docstring on why torch's default stream cannot be used.
+        self._stream = torch.cuda.Stream(device=self.device) if self._is_cuda else None
+
         if providers is None:
-            providers = self._default_providers(ort, self.device)
+            providers = self._default_providers(ort, self.device, self._stream)
 
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -178,25 +226,93 @@ class SonicOnnxPolicy:
         self.providers = self._encoder.get_providers()
         self._encoder_input = self._encoder.get_inputs()[0].name
         self._decoder_input = self._decoder.get_inputs()[0].name
+        self._encoder_output = self._encoder.get_outputs()[0].name
+        self._decoder_output = self._decoder.get_outputs()[0].name
 
-        if self.device.type == "cuda" and "CUDAExecutionProvider" not in self.providers:
+        self._gpu_resident = self._is_cuda and "CUDAExecutionProvider" in self.providers
+        if self._is_cuda and not self._gpu_resident:
             import warnings
 
             warnings.warn(
                 "SONIC ONNX is running on CPU while the simulation is on CUDA. The decoder is "
                 "~37M params and costs ~17 ms per step there, against a 20 ms control period at "
-                "50 Hz. Install the GPU runtime for real-time teleoperation:\n"
+                "50 Hz. Falling back to the host round-trip path. Install the GPU runtime for "
+                "real-time teleoperation:\n"
                 "    uv pip install --python <isaaclab-venv>/bin/python onnxruntime-gpu",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
+        self._init_buffers()
+        if self._gpu_resident:
+            self._init_bindings()
+
+    def _init_buffers(self) -> None:
+        """Preallocate every fixed-shape tensor the control loop touches.
+
+        The encoder observation is zeroed once here. ``smpl`` mode only ever writes its own slots,
+        and the mode id / one-hot are constants, so the hot path never re-zeros the full 1751-wide
+        vector nor ships a constant from host to device.
+        """
+        alloc = dict(device=self.device, dtype=torch.float32)
+        self.encoder_obs = torch.zeros(self.BATCH, SONIC_ENCODER_INPUT_DIM, **alloc)
+        self.latent = torch.zeros(self.BATCH, SONIC_TOKEN_DIM, **alloc)
+        self.decoder_obs = torch.zeros(self.BATCH, SONIC_DECODER_INPUT_DIM, **alloc)
+        self.action = torch.zeros(self.BATCH, SONIC_NUM_ACTIONS, **alloc)
+
+        # Constant encoder terms, written once rather than per frame.
+        self.encoder_obs[:, SmplEncoderSlots.MODE_ID] = float(ENCODER_MODE_SMPL)
+        self.encoder_obs[:, SmplEncoderSlots.ENCODER_INDEX] = torch.tensor([0.0, 0.0, 1.0], **alloc)
+
+        #: Views into the decoder input, so callers can fill it without a concatenation.
+        self.decoder_token_view = self.decoder_obs[:, :SONIC_TOKEN_DIM]
+        self.decoder_proprio_view = self.decoder_obs[:, SONIC_TOKEN_DIM:]
+
+    def _init_bindings(self) -> None:
+        """Bind the preallocated CUDA buffers to both sessions, once."""
+        device_id = self.device.index
+        self._enc_binding = self._encoder.io_binding()
+        self._enc_binding.bind_input(
+            self._encoder_input,
+            "cuda",
+            device_id,
+            np.float32,
+            tuple(self.encoder_obs.shape),
+            self.encoder_obs.data_ptr(),
+        )
+        self._enc_binding.bind_output(
+            self._encoder_output,
+            "cuda",
+            device_id,
+            np.float32,
+            tuple(self.latent.shape),
+            self.latent.data_ptr(),
+        )
+        self._dec_binding = self._decoder.io_binding()
+        self._dec_binding.bind_input(
+            self._decoder_input,
+            "cuda",
+            device_id,
+            np.float32,
+            tuple(self.decoder_obs.shape),
+            self.decoder_obs.data_ptr(),
+        )
+        self._dec_binding.bind_output(
+            self._decoder_output,
+            "cuda",
+            device_id,
+            np.float32,
+            tuple(self.action.shape),
+            self.action.data_ptr(),
+        )
+
     @staticmethod
-    def _default_providers(ort, device: torch.device) -> list:
+    def _default_providers(ort, device: torch.device, stream=None) -> list:
         """Prefer the CUDA execution provider on the simulation's own GPU.
 
         We bind ``device_id`` to the torch device so ONNX runs on the same GPU as the simulation,
-        rather than defaulting to device 0 on a multi-GPU machine.
+        rather than defaulting to device 0 on a multi-GPU machine, and hand over ``stream`` as the
+        provider's compute stream so ORT and torch serialize against each other for free.
 
         TensorRT is deliberately *not* selected by default: it is faster in steady state but pays a
         multi-minute engine build on first run, which is a poor default for interactive bring-up.
@@ -205,48 +321,134 @@ class SonicOnnxPolicy:
         available = set(ort.get_available_providers())
         providers: list = []
         if device.type == "cuda" and "CUDAExecutionProvider" in available:
-            providers.append(
-                ("CUDAExecutionProvider", {"device_id": device.index or 0})
-            )
+            opts: dict = {"device_id": device.index}
+            if stream is not None:
+                opts["has_user_compute_stream"] = "1"
+                opts["user_compute_stream"] = str(stream.cuda_stream)
+            providers.append(("CUDAExecutionProvider", opts))
         providers.append("CPUExecutionProvider")
         return providers
+
+    @property
+    def gpu_resident(self) -> bool:
+        """Whether inference runs zero-copy on the GPU."""
+        return self._gpu_resident
+
+    @contextlib.contextmanager
+    def compute_stream(self):
+        """Run caller tensor work on the same stream onnxruntime uses.
+
+        Joins are CUDA events in both directions, so neither entry nor exit blocks the host. A
+        no-op when not GPU-resident.
+
+        The device is set alongside the stream: ``torch.cuda.stream`` swaps the active stream but
+        leaves the current device alone, so on a multi-GPU host a caller running with a different
+        current device would otherwise allocate temporaries on the wrong GPU.
+        """
+        if self._stream is None:
+            yield
+            return
+        with torch.cuda.device(self.device):
+            caller = torch.cuda.current_stream(self.device)
+            self._stream.wait_stream(caller)
+            try:
+                with torch.cuda.stream(self._stream):
+                    yield
+            finally:
+                caller.wait_stream(self._stream)
+
+    def _check_batch(self, tensor: torch.Tensor, what: str) -> None:
+        if tensor.shape[0] != self.BATCH:
+            raise ValueError(
+                f"{what} has batch {tensor.shape[0]}, but the SONIC ONNX graphs are exported "
+                f"with a static batch of {self.BATCH}. Run a single environment, or re-export "
+                "the graphs with a dynamic batch axis."
+            )
 
     def encode(self, encoder_obs: torch.Tensor) -> torch.Tensor:
         """Run the encoder.
 
         Args:
-            encoder_obs: ``(1, 1751)`` assembled encoder observation.
+            encoder_obs: ``(1, 1751)`` assembled encoder observation. When this is
+                :attr:`encoder_obs` itself the copy is skipped and the call is fully zero-copy.
 
         Returns:
-            ``(1, 64)`` motion token.
+            ``(1, 64)`` motion token. On CUDA this is :attr:`latent`, a persistent buffer that is
+            overwritten by the next call -- clone it if you need to retain it.
         """
         if encoder_obs.shape[-1] != SONIC_ENCODER_INPUT_DIM:
             raise ValueError(
                 f"encoder input must be {SONIC_ENCODER_INPUT_DIM}-wide, "
                 f"got {encoder_obs.shape[-1]}"
             )
-        arr = encoder_obs.detach().cpu().numpy().astype(np.float32)
-        token = self._encoder.run(None, {self._encoder_input: arr})[0]
-        return torch.from_numpy(token).to(self.device)
+        self._check_batch(encoder_obs, "encoder_obs")
+        if not self._gpu_resident:
+            arr = encoder_obs.detach().cpu().numpy().astype(np.float32)
+            token = self._encoder.run(None, {self._encoder_input: arr})[0]
+            return torch.from_numpy(token).to(self.device)
+
+        if encoder_obs.data_ptr() != self.encoder_obs.data_ptr():
+            self.encoder_obs.copy_(encoder_obs)
+        self._encoder.run_with_iobinding(self._enc_binding)
+        return self.latent
 
     def decode(self, token: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
         """Run the decoder.
+
+        The 994-wide input is assembled by writing into the two halves of the preallocated
+        :attr:`decoder_obs` rather than concatenating a fresh tensor each step.
 
         Args:
             token: ``(1, 64)`` motion token from :meth:`encode`.
             proprio: ``(1, 930)`` flattened proprioception history.
 
         Returns:
-            ``(1, 29)`` raw (pre-scale) joint actions.
+            ``(1, 29)`` raw (pre-scale) joint actions. On CUDA this is :attr:`action`, a persistent
+            buffer overwritten by the next call.
         """
-        obs = torch.cat([token, proprio], dim=-1)
-        if obs.shape[-1] != SONIC_DECODER_INPUT_DIM:
-            raise ValueError(
-                f"decoder input must be {SONIC_DECODER_INPUT_DIM}-wide, got {obs.shape[-1]}"
-            )
-        arr = obs.detach().cpu().numpy().astype(np.float32)
-        action = self._decoder.run(None, {self._decoder_input: arr})[0]
-        return torch.from_numpy(action).to(self.device)
+        width = token.shape[-1] + proprio.shape[-1]
+        if width != SONIC_DECODER_INPUT_DIM:
+            raise ValueError(f"decoder input must be {SONIC_DECODER_INPUT_DIM}-wide, got {width}")
+        self._check_batch(token, "token")
+        if not self._gpu_resident:
+            obs = torch.cat([token, proprio], dim=-1)
+            arr = obs.detach().cpu().numpy().astype(np.float32)
+            action = self._decoder.run(None, {self._decoder_input: arr})[0]
+            return torch.from_numpy(action).to(self.device)
+
+        if token.data_ptr() != self.decoder_token_view.data_ptr():
+            self.decoder_token_view.copy_(token)
+        if proprio.data_ptr() != self.decoder_proprio_view.data_ptr():
+            self.decoder_proprio_view.copy_(proprio)
+        self._decoder.run_with_iobinding(self._dec_binding)
+        return self.action
+
+    def fill_smpl_encoder_obs(
+        self,
+        smpl_joints: torch.Tensor,
+        anchor_ori_6d: torch.Tensor,
+        wrist_joint_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write the ``smpl`` slots of the persistent encoder observation in place.
+
+        The mode id and one-hot were written once at construction and the non-``smpl`` slots stay
+        zero for the process lifetime, so only the three varying blocks are touched here.
+
+        Args:
+            smpl_joints: ``(1, 10, 24, 3)`` root-local reference joint positions.
+            anchor_ori_6d: ``(1, 10, 6)`` heading-relative root orientation.
+            wrist_joint_pos: ``(1, 10, 6)`` G1 wrist joint angles.
+
+        Returns:
+            :attr:`encoder_obs`, ready to hand to :meth:`encode`.
+        """
+        self._check_batch(smpl_joints, "smpl_joints")
+        obs = self.encoder_obs
+        batch = obs.shape[0]
+        obs[:, SmplEncoderSlots.SMPL_JOINTS] = smpl_joints.reshape(batch, -1)
+        obs[:, SmplEncoderSlots.SMPL_ANCHOR_ORI] = anchor_ori_6d.reshape(batch, -1)
+        obs[:, SmplEncoderSlots.WRIST_JOINT_POS] = wrist_joint_pos.reshape(batch, -1)
+        return obs
 
     @staticmethod
     def assemble_smpl_encoder_obs(
@@ -254,7 +456,10 @@ class SonicOnnxPolicy:
         anchor_ori_6d: torch.Tensor,
         wrist_joint_pos: torch.Tensor,
     ) -> torch.Tensor:
-        """Build the 1751-wide encoder input for ``smpl`` mode.
+        """Build a fresh 1751-wide encoder input for ``smpl`` mode.
+
+        Allocating variant retained for callers outside the control loop (tests, tooling). The
+        ActionTerm uses :meth:`fill_smpl_encoder_obs` instead, which writes into the bound buffer.
 
         Args:
             smpl_joints: ``(N, 10, 24, 3)`` root-local reference joint positions.

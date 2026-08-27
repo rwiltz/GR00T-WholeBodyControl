@@ -28,6 +28,29 @@ does by pinning its playback cursor at ``timesteps - 11``
 (``g1_deploy_onnx_ref.cpp:3394-3398``) — we present the 10 most recent frames and let the policy
 treat the oldest as "now". The robot therefore trails the operator by ~200 ms. This is inherent to
 the checkpoint, not a bug: the ``low_latency`` checkpoint reduces the window and hence the lag.
+
+Hot-path discipline
+-------------------
+``process_actions`` runs at the control rate and is written to stay GPU-resident:
+
+* Every fixed-shape tensor is preallocated. The step writes into slices rather than building
+  fresh tensors, so steady state performs no allocation of policy inputs or outputs.
+* Steady state never reads a CUDA tensor's *value* from Python. Guards of the form
+  ``if bool(mask.any())`` forced a device synchronize on every control step just to learn that
+  the branch was not taken. Two different replacements were needed, because the two guards asked
+  different questions. History/window priming depends only on whether a reset has occurred, which
+  the host already knows, so it is gated on a plain Python mirror flag and the per-environment
+  detail is resolved with a mask select. The heading latch instead depends on a validity flag
+  carried inside the reference data, so it is read back -- but only while some environment is
+  still unlatched, never once latching has completed.
+* The reference window is a mirrored ring (see :mod:`.proprio_history`) rather than a
+  ``torch.roll``, so advancing costs two frame writes instead of rewriting the window.
+* All of it, including onnxruntime, issues into a single CUDA stream owned by
+  :class:`~gear_sonic.lab_teleop.mdp.sonic_policy.SonicOnnxPolicy`, joined to the caller's stream
+  with events at entry and exit.
+
+Set ``enable_profiling`` on the config to get a per-stage CUDA-event breakdown; it is off by
+default and costs nothing when off. See :meth:`SonicWholeBodyAction.profiling_report`.
 """
 
 from __future__ import annotations
@@ -36,12 +59,12 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
-import torch
-
 from isaaclab.assets.articulation import Articulation
 from isaaclab.managers.action_manager import ActionTerm, ActionTermCfg
 from isaaclab.utils.configclass import configclass
+import torch
 
+from gear_sonic.lab_teleop.mdp.profiling import StageProfiler, StageStats
 from gear_sonic.lab_teleop.mdp.proprio_history import (
     SONIC_HISTORY_LENGTH,
     SonicProprioHistory,
@@ -59,7 +82,19 @@ from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
-__all__ = ["SonicWholeBodyAction", "SonicWholeBodyActionCfg"]
+__all__ = ["SONIC_PROFILE_STAGES", "SonicWholeBodyAction", "SonicWholeBodyActionCfg"]
+
+#: Stages reported by :meth:`SonicWholeBodyAction.profiling_report`, in control-flow order.
+SONIC_PROFILE_STAGES = [
+    "reference_history_update",
+    "proprio_history_update",
+    "encoder_obs_construction",
+    "encoder_inference",
+    "decoder_obs_construction",
+    "decoder_inference",
+    "output_postprocessing",
+    "total_process_actions",
+]
 
 
 def isaaclab_quat_to_wxyz(quat_xyzw: torch.Tensor) -> torch.Tensor:
@@ -102,6 +137,12 @@ class SonicWholeBodyActionCfg(ActionTermCfg):
     policy_device: str = "cuda:0"
     """Device for ONNX inference. See the module note on CPU cost at 50 Hz."""
 
+    enable_profiling: bool = False
+    """Record per-stage CUDA-event timings. Off by default; see :meth:`profiling_report`."""
+
+    profile_capacity: int = 512
+    """Samples retained per stage when profiling is enabled."""
+
 
 class SonicWholeBodyAction(ActionTerm):
     """Runs SONIC end to end: teleop reference in, 29 joint position targets out."""
@@ -114,10 +155,18 @@ class SonicWholeBodyAction(ActionTerm):
         self._env = env
 
         self._policy = SonicOnnxPolicy(cfg.checkpoint_dir, device=self.device)
+        if self.num_envs != self._policy.BATCH:
+            # Fail here rather than at the first control step. The shipped graphs have a static
+            # batch axis, so a vectorized scene can never work -- and letting it through produces
+            # an opaque broadcast error from inside observation assembly instead.
+            raise ValueError(
+                f"SonicWholeBodyAction requires num_envs == {self._policy.BATCH}, got "
+                f"{self.num_envs}. The SONIC encoder/decoder ONNX graphs are exported with a "
+                "static batch of 1; re-export them with a dynamic batch axis to run a "
+                "vectorized scene."
+            )
 
-        joint_ids, self._joint_names = self._asset.find_joints(
-            cfg.joint_names, preserve_order=True
-        )
+        joint_ids, self._joint_names = self._asset.find_joints(cfg.joint_names, preserve_order=True)
         self._joint_ids = torch.as_tensor(joint_ids, device=self.device)
         if len(self._joint_names) != SONIC_NUM_ACTIONS:
             raise ValueError(
@@ -127,30 +176,47 @@ class SonicWholeBodyAction(ActionTerm):
 
         self._scale = self._resolve_action_scale(cfg.action_scale)
         self._offset = self._asset.data.default_joint_pos.torch[:, self._joint_ids].clone()
+        # Constant for the episode, so the per-step relative velocity is a subtraction rather
+        # than a second gather.
+        self._default_joint_vel = self._asset.data.default_joint_vel.torch[
+            :, self._joint_ids
+        ].clone()
 
         self._history = SonicProprioHistory(
             num_envs=self.num_envs,
             num_joints=SONIC_NUM_ACTIONS,
             device=self.device,
         )
-        # Rolling window of reference frames; the encoder consumes all of it each step.
+        # Mirrored ring of reference frames; the encoder consumes the whole window each step.
+        # Doubled length keeps the chronological window a contiguous slice -- see .proprio_history.
         self._reference_window = torch.zeros(
-            self.num_envs, SONIC_HISTORY_LENGTH, SONIC_REFERENCE_DIM, device=self.device
+            self.num_envs, 2 * SONIC_HISTORY_LENGTH, SONIC_REFERENCE_DIM, device=self.device
         )
-        self._window_primed = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
+        self._reference_write = SONIC_HISTORY_LENGTH - 1
+        self._window_primed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        #: Host mirror of ``_window_primed.all()``; keeps the backfill off the steady-state path.
+        self._window_all_primed = False
         # Operator->robot heading alignment, latched on first valid reference after a reset.
         self._apply_delta_heading = torch.zeros(self.num_envs, 4, device=self.device)
         self._apply_delta_heading[:, 0] = 1.0
-        self._heading_latched = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
+        self._identity_quat = self._apply_delta_heading.clone()
+        self._heading_latched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        #: Host mirror of ``_heading_latched.all()``. False only during the brief pre-latch phase,
+        #: which is the sole window in which this term reads a CUDA value from Python.
+        self._heading_all_latched = False
 
-        self._raw_actions = torch.zeros(
-            self.num_envs, SONIC_NUM_ACTIONS, device=self.device
-        )
+        self._raw_actions = torch.zeros(self.num_envs, SONIC_NUM_ACTIONS, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
+        # Scratch for the proprioception frame, refilled in place each step.
+        self._joint_pos_rel = torch.zeros_like(self._raw_actions)
+        self._joint_vel_rel = torch.zeros_like(self._raw_actions)
+
+        self._profiler = StageProfiler(
+            SONIC_PROFILE_STAGES,
+            enabled=bool(getattr(cfg, "enable_profiling", False)),
+            device=self.device,
+            capacity=int(getattr(cfg, "profile_capacity", 512)),
+        )
 
         self._warn_if_xr_anchor_missing(env)
 
@@ -201,6 +267,18 @@ class SonicWholeBodyAction(ActionTerm):
         """Joint position targets actually written to the articulation."""
         return self._processed_actions
 
+    def profiling_report(self) -> StageStats:
+        """Per-stage timing summary (mean / p50 / p95, milliseconds).
+
+        Empty unless ``cfg.enable_profiling`` is set. Synchronizes the device once per call, so
+        call it on a reporting cadence, never inside the control loop.
+        """
+        return self._profiler.report()
+
+    def reset_profiling(self) -> None:
+        """Drop accumulated profiling samples."""
+        self._profiler.reset()
+
     def _resolve_action_scale(self, scale_cfg: dict[str, float]) -> torch.Tensor:
         """Expand a ``{joint-name-regex: scale}`` mapping into a per-joint tensor."""
         scale = torch.ones(SONIC_NUM_ACTIONS, device=self.device)
@@ -223,16 +301,20 @@ class SonicWholeBodyAction(ActionTerm):
         ``AgileBasedLowerBodyAction`` omits this, which leaks the previous episode's final action
         into the next episode's first observation. SONIC carries far more state, so resetting is
         mandatory here.
+
+        The reference ring's write index is shared across environments and deliberately left
+        alone: a reset environment is marked unprimed, and its next append backfills every slot,
+        so the window is correct for it regardless of where the cursor happens to sit.
         """
         if env_ids is None:
             env_ids = slice(None)
         self._history.reset(env_ids)
         self._reference_window[env_ids] = 0.0
         self._window_primed[env_ids] = False
+        self._window_all_primed = False
         self._heading_latched[env_ids] = False
-        self._apply_delta_heading[env_ids] = torch.tensor(
-            [1.0, 0.0, 0.0, 0.0], device=self.device
-        )
+        self._heading_all_latched = False
+        self._apply_delta_heading[env_ids] = self._identity_quat[env_ids]
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
 
@@ -242,16 +324,31 @@ class SonicWholeBodyAction(ActionTerm):
         Args:
             actions: ``(num_envs, 83)`` SONIC reference frames from the teleop retargeter.
         """
-        with torch.inference_mode():
-            self._push_reference(actions.to(self.device))
-            self._append_proprioception()
+        with torch.inference_mode(), self._policy.compute_stream():
+            with self._profiler.stage("total_process_actions"):
+                with self._profiler.stage("reference_history_update"):
+                    self._push_reference(actions.to(self.device))
+                with self._profiler.stage("proprio_history_update"):
+                    self._append_proprioception()
 
-            encoder_obs = self._build_encoder_obs()
-            token = self._policy.encode(encoder_obs)
-            raw = self._policy.decode(token, self._history.flat())
+                with self._profiler.stage("encoder_obs_construction"):
+                    encoder_obs = self._build_encoder_obs()
+                with self._profiler.stage("encoder_inference"):
+                    token = self._policy.encode(encoder_obs)
 
-            self._raw_actions[:] = raw
-            self._processed_actions[:] = raw * self._scale + self._offset
+                with self._profiler.stage("decoder_obs_construction"):
+                    # Write the history straight into the decoder's bound input slice, so the
+                    # 930-wide vector is never materialized separately.
+                    proprio = self._history.flat(out=self._policy.decoder_proprio_view)
+                with self._profiler.stage("decoder_inference"):
+                    raw = self._policy.decode(token, proprio)
+
+                with self._profiler.stage("output_postprocessing"):
+                    self._raw_actions.copy_(raw)
+                    # raw * scale + offset, via out-parameters so no temporary is built and the
+                    # arithmetic stays bit-identical to the original expression (no fused FMA).
+                    torch.mul(self._raw_actions, self._scale, out=self._processed_actions)
+                    self._processed_actions.add_(self._offset)
 
     def apply_actions(self) -> None:
         """Write the joint position targets to the articulation."""
@@ -259,29 +356,47 @@ class SonicWholeBodyAction(ActionTerm):
             target=self._processed_actions, joint_ids=self._joint_ids
         )
 
+    def _reference_view(self) -> torch.Tensor:
+        """``(num_envs, 10, 83)`` reference window, oldest frame first."""
+        start = self._reference_write + 1
+        return self._reference_window[:, start : start + SONIC_HISTORY_LENGTH]
+
     def _push_reference(self, reference: torch.Tensor) -> None:
-        """Roll the reference window, backfilling it on the first frame after a reset."""
-        unprimed = ~self._window_primed
-        self._reference_window[:] = torch.roll(self._reference_window, shifts=-1, dims=1)
-        self._reference_window[:, -1] = reference
-        if bool(unprimed.any()):
-            self._reference_window[unprimed] = (
-                reference[unprimed].unsqueeze(1).expand(-1, SONIC_HISTORY_LENGTH, -1)
+        """Advance the reference ring, backfilling it on the first frame after a reset."""
+        write = (self._reference_write + 1) % SONIC_HISTORY_LENGTH
+        self._reference_window[:, write] = reference
+        self._reference_window[:, write + SONIC_HISTORY_LENGTH] = reference
+        # Pending-backfill is a reset-driven fact the host already knows, so steady state skips
+        # this without touching the device; *which* rows need it stays a GPU-side mask select.
+        if not self._window_all_primed:
+            backfill = (~self._window_primed).view(-1, 1, 1)
+            self._reference_window.copy_(
+                torch.where(backfill, reference.unsqueeze(1), self._reference_window)
             )
-        self._window_primed[:] = True
+            self._window_primed[:] = True
+            self._window_all_primed = True
+        self._reference_write = write
 
-        # Latch the operator/robot heading alignment on the first valid reference.
-        valid = reference[:, SonicReferenceSlice.VALID].squeeze(-1) > 0.5
-        to_latch = valid & (~self._heading_latched)
-        if bool(to_latch.any()):
-            self._latch_heading(to_latch, reference)
+        # Unlike priming, latching depends on the validity flag carried *inside* the reference, so
+        # the host cannot know when it completes without a read. We therefore read -- but only
+        # while at least one environment is still unlatched. Once every environment has latched,
+        # this whole block is skipped by a Python bool and steady state never synchronizes.
+        if not self._heading_all_latched:
+            self._latch_heading(reference)
+            self._heading_all_latched = bool(self._heading_latched.all())
 
-    def _latch_heading(self, mask: torch.Tensor, reference: torch.Tensor) -> None:
+    def _latch_heading(self, reference: torch.Tensor) -> None:
         """Align the operator's initial facing to the robot's, so yaw does not accumulate.
 
         Mirrors ``ComputeApplyDeltaHeading`` (``g1_deploy_onnx_ref.cpp:589-602``)::
 
             apply_delta_heading = heading(robot_base_quat) * heading_inv(reference_root_quat)
+
+        The delta is computed every step and written only where an environment has a valid
+        reference and has not latched yet. Computing unconditionally trades a few small kernels
+        for the device synchronize that the previous ``if bool(to_latch.any())`` guard cost on
+        every control step. Values from environments that should not latch are discarded by the
+        select, so a degenerate quaternion on an invalid frame cannot leak in.
         """
         from gear_sonic.isaac_utils.rotations import (
             calc_heading_quat,
@@ -289,37 +404,40 @@ class SonicWholeBodyAction(ActionTerm):
             quat_mul,
         )
 
+        valid = reference[:, SonicReferenceSlice.VALID].squeeze(-1) > 0.5
+        to_latch = (valid & (~self._heading_latched)).unsqueeze(-1)
+
         base_quat = isaaclab_quat_to_wxyz(self._asset.data.root_quat_w.torch)
         init_heading = calc_heading_quat(base_quat, w_last=False)
         ref_quat = reference[:, SonicReferenceSlice.ROOT_QUAT]
         ref_heading_inv = calc_heading_quat_inv(ref_quat, w_last=False)
         delta = quat_mul(init_heading, ref_heading_inv, w_last=False)
 
-        self._apply_delta_heading[mask] = delta[mask]
-        self._heading_latched[mask] = True
+        self._apply_delta_heading.copy_(torch.where(to_latch, delta, self._apply_delta_heading))
+        self._heading_latched |= valid
 
     def _append_proprioception(self) -> None:
         """Push the current robot state into the decoder's history buffers."""
         data = self._asset.data
-        joint_pos_rel = (
-            data.joint_pos.torch[:, self._joint_ids]
-            - data.default_joint_pos.torch[:, self._joint_ids]
-        )
-        joint_vel_rel = (
-            data.joint_vel.torch[:, self._joint_ids]
-            - data.default_joint_vel.torch[:, self._joint_ids]
-        )
+        # Gather into preallocated scratch, then subtract the (constant) defaults in place.
+        torch.index_select(data.joint_pos.torch, 1, self._joint_ids, out=self._joint_pos_rel)
+        self._joint_pos_rel.sub_(self._offset)
+        torch.index_select(data.joint_vel.torch, 1, self._joint_ids, out=self._joint_vel_rel)
+        self._joint_vel_rel.sub_(self._default_joint_vel)
         self._history.append(
             base_ang_vel=data.root_ang_vel_b.torch,
-            joint_pos_rel=joint_pos_rel,
-            joint_vel_rel=joint_vel_rel,
+            joint_pos_rel=self._joint_pos_rel,
+            joint_vel_rel=self._joint_vel_rel,
             last_action=self._raw_actions,
             gravity_dir=data.projected_gravity_b.torch,
         )
 
     def _build_encoder_obs(self) -> torch.Tensor:
-        """Assemble the ``smpl``-mode encoder observation from the reference window."""
-        window = self._reference_window
+        """Assemble the ``smpl``-mode encoder observation from the reference window.
+
+        Writes into the policy's bound encoder buffer; the returned tensor is that buffer.
+        """
+        window = self._reference_view()
         num_envs = window.shape[0]
 
         smpl_joints = window[:, :, SonicReferenceSlice.SMPL_JOINTS].reshape(
@@ -333,6 +451,4 @@ class SonicWholeBodyAction(ActionTerm):
             robot_base_quat=isaaclab_quat_to_wxyz(self._asset.data.root_quat_w.torch),
             apply_delta_heading=self._apply_delta_heading,
         )
-        return SonicOnnxPolicy.assemble_smpl_encoder_obs(smpl_joints, anchor_ori, wrist)
-
-
+        return self._policy.fill_smpl_encoder_obs(smpl_joints, anchor_ori, wrist)

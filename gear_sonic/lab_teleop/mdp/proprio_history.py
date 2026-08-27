@@ -28,6 +28,39 @@ the origin with zero everything".
 This deliberately differs from the C++ deploy stack, whose ``StateLogger`` zero-pads for the first
 ~10 ticks at startup. We follow the Isaac Lab / training-time convention, since that is the
 distribution SONIC was trained under.
+
+Storage: mirrored ring
+----------------------
+Each term is stored as ``(num_envs, 2H, dim)`` and every frame is written twice -- at ``w`` and at
+``w + H``. That makes the chronological window a **contiguous slice** ``[w+1 : w+1+H]`` for any
+write position, so reading needs neither a gather nor an index-dependent two-piece copy::
+
+    H = 4, newest just written at w = 1
+
+    index:   0   1   2   3 | 4   5   6   7
+    content: d   a   b   c | d   a   b   c
+                 ^-------------^
+                 window [2:6] = b c d a   -> oldest .. newest
+
+The previous implementation instead called ``torch.roll`` on every term every tick, which
+allocates a full copy of each buffer and rewrites all H frames to advance by one. The mirrored ring
+writes 2 frames and advances an integer.
+
+The doubling costs 930 extra floats per environment, which is negligible next to avoiding five
+per-tick buffer copies.
+
+Backfill without synchronizing
+------------------------------
+The previous implementation guarded the backfill with ``if bool(unprimed.any())``, reading a CUDA
+tensor from Python and thereby forcing a device synchronize on *every* control step purely to
+discover that -- in steady state -- there was nothing to backfill.
+
+The replacement splits the question in two. *Whether* any backfill is pending depends only on
+whether :meth:`SonicProprioHistory.reset` has been called since the last append, which the host
+already witnessed; that is tracked in a plain Python bool, so steady state skips the work entirely
+without consulting the device. *Which* environments need it is a per-env mask, applied with
+:func:`torch.where` so the answer never leaves the GPU. ``where`` selects between operands rather
+than blending them, so untouched environments keep bit-identical values.
 """
 
 from __future__ import annotations
@@ -99,21 +132,35 @@ class SonicProprioHistory:
             "joint_dim": num_joints,
             "gravity_dim": 3,
         }
+        # Mirrored ring: 2H frames so the ordered window is always contiguous.
         self._buffers: dict[str, torch.Tensor] = {
-            term: torch.zeros(
-                num_envs, history_length, self._dims[dim_key], device=self.device
-            )
+            term: torch.zeros(num_envs, 2 * history_length, self._dims[dim_key], device=self.device)
             for term, dim_key in self._TERM_DIMS
         }
+        #: Index of the newest frame within ``[0, history_length)``.
+        self._write = history_length - 1
         # False => the next append for this env backfills the whole window.
         self._primed = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        #: Host mirror of "``_primed`` is all True". Lets the hot path skip the backfill without
+        #: reading ``_primed`` back from the device.
+        self._all_primed = False
+
+        # Persistent flat output plus per-term (N, H, D) views into it, so ``flat`` is a set of
+        # contiguous copies into an existing allocation rather than a fresh ``torch.cat``.
+        self._flat = torch.zeros(num_envs, self.flat_dim, device=self.device)
+        self._flat_views: dict[str, torch.Tensor] = {}
+        offset = 0
+        for term, dim_key in self._TERM_DIMS:
+            width = self._dims[dim_key] * history_length
+            self._flat_views[term] = self._flat[:, offset : offset + width].view(
+                num_envs, history_length, self._dims[dim_key]
+            )
+            offset += width
 
     @property
     def flat_dim(self) -> int:
         """Width of :meth:`flat`'s output."""
-        return sum(
-            self._dims[dim_key] * self.history_length for _, dim_key in self._TERM_DIMS
-        )
+        return sum(self._dims[dim_key] * self.history_length for _, dim_key in self._TERM_DIMS)
 
     def reset(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None) -> None:
         """Clear history for the given environments.
@@ -130,6 +177,7 @@ class SonicProprioHistory:
         for buf in self._buffers.values():
             buf[env_ids] = 0.0
         self._primed[env_ids] = False
+        self._all_primed = False
 
     def append(
         self,
@@ -142,7 +190,8 @@ class SonicProprioHistory:
     ) -> None:
         """Push one frame for every environment.
 
-        Unprimed environments have the whole window filled with this frame; primed ones roll by one.
+        Unprimed environments have the whole window filled with this frame; primed ones advance by
+        one. Neither path reads a tensor value from Python, so no device synchronization occurs.
 
         Args:
             base_ang_vel: ``(num_envs, 3)`` base angular velocity in the body frame.
@@ -162,26 +211,64 @@ class SonicProprioHistory:
             value = frame[term]
             expected = (self.num_envs, self._dims[dim_key])
             if tuple(value.shape) != expected:
-                raise ValueError(
-                    f"{term}: expected shape {expected}, got {tuple(value.shape)}"
-                )
+                raise ValueError(f"{term}: expected shape {expected}, got {tuple(value.shape)}")
 
-        unprimed = ~self._primed
+        history = self.history_length
+        write = (self._write + 1) % history
+        # Whether a backfill is pending depends only on whether ``reset`` has been called since
+        # the last append -- an event the host already witnessed. Tracking it in a Python bool
+        # means steady state neither reads a CUDA tensor nor runs the select at all.
+        needs_backfill = not self._all_primed
+        backfill = (~self._primed).view(-1, 1, 1) if needs_backfill else None
+
         for term, _ in self._TERM_DIMS:
             buf = self._buffers[term]
             value = frame[term].to(device=buf.device, dtype=buf.dtype)
-            # Roll every env by one and write the newest frame at the end...
-            buf[:] = torch.roll(buf, shifts=-1, dims=1)
-            buf[:, -1] = value
-            # ...then overwrite the whole window for envs that were unprimed (backfill).
-            if bool(unprimed.any()):
-                buf[unprimed] = value[unprimed].unsqueeze(1).expand(-1, self.history_length, -1)
+            # Write the newest frame into both mirrors of the ring...
+            buf[:, write] = value
+            buf[:, write + history] = value
+            # ...then, only when a reset is outstanding, fill every slot for the environments it
+            # touched. Mask-selected rather than index-selected, so no host sync is needed to
+            # discover *which* environments those are.
+            if needs_backfill:
+                buf.copy_(torch.where(backfill, value.unsqueeze(1), buf))
 
-        self._primed[:] = True
+        self._write = write
+        if needs_backfill:
+            self._primed[:] = True
+        self._all_primed = True
 
-    def flat(self) -> torch.Tensor:
-        """Return ``(num_envs, 930)`` in the decoder's expected concatenation order."""
-        return torch.cat(
-            [self._buffers[term].flatten(start_dim=1) for term, _ in self._TERM_DIMS],
-            dim=-1,
-        )
+    def window(self, term: str) -> torch.Tensor:
+        """Return ``(num_envs, H, dim)`` for one term, oldest frame first."""
+        start = self._write + 1
+        return self._buffers[term][:, start : start + self.history_length]
+
+    def flat(self, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Return ``(num_envs, 930)`` in the decoder's expected concatenation order.
+
+        Args:
+            out: Optional destination. Passing the decoder's own bound input slice lets the
+                history land straight in the buffer onnxruntime reads, avoiding another copy.
+
+        Returns:
+            ``out`` when given, else an internal persistent buffer that is overwritten on the next
+            call.
+        """
+        if out is None:
+            for term, _ in self._TERM_DIMS:
+                self._flat_views[term].copy_(self.window(term))
+            return self._flat
+
+        if out.shape != (self.num_envs, self.flat_dim):
+            raise ValueError(
+                f"out must be {(self.num_envs, self.flat_dim)}, got {tuple(out.shape)}"
+            )
+        offset = 0
+        for term, dim_key in self._TERM_DIMS:
+            width = self._dims[dim_key] * self.history_length
+            view = out[:, offset : offset + width].view(
+                self.num_envs, self.history_length, self._dims[dim_key]
+            )
+            view.copy_(self.window(term))
+            offset += width
+        return out
