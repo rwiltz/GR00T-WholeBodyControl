@@ -62,6 +62,9 @@ class _FakeArticulationData:
         root_quat[:, 3] = 1.0
         self.root_quat_w = _Proxy(root_quat)
         self.root_ang_vel_b = _Proxy(z(num_envs, 3))
+        root_pos = z(num_envs, 3)
+        root_pos[:, 2] = 0.76
+        self.root_pos_w = _Proxy(root_pos)
         gravity = z(num_envs, 3)
         gravity[:, 2] = -1.0
         self.projected_gravity_b = _Proxy(gravity)

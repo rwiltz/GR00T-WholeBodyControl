@@ -47,6 +47,7 @@ __all__ = [
     "build_sonic_fullbody_replay_pipeline",
     "make_sonic_fullbody_pipeline_builder",
     "make_sonic_hands_pipeline_builder",
+    "make_sonic_modal_pipeline_builder",
 ]
 
 #: DeviceIO vendor string for PICO body tracking (``XR_BD_body_tracking``).
@@ -206,6 +207,93 @@ def make_sonic_hands_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_
                 "sonic_reference": reference.output("sonic_reference"),
                 "left_hand": hand_outputs["left"],
                 "right_hand": hand_outputs["right"],
+            }
+        )
+        return OutputCombiner({"action": reorderer.output("output")})
+
+    return _build
+
+
+def make_sonic_modal_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_VENDOR):
+    """Full-body reference plus operator mode selection and a locomotion command.
+
+    Adds the controller branch that lets the operator switch between SONIC's ``smpl`` (full-body
+    tracking) and ``teleop`` (stick-driven walking) encoder modes::
+
+        ControllersSource -> LocomotionRootCmdRetargeter --+
+                                                           +-> SonicTeleopCommandRetargeter --+
+        FullBodySource -> SonicFullBodyRetargeter ---------+----------------------------------+
+                                                                                              |
+                                                                                    TensorReorderer
+
+    Only operator-derived quantities are computed here. The velocity planner that turns the
+    command into a lower-body reference is closed-loop on the robot and lives in the action term.
+
+    Action layout is ``[sonic_reference(83) | mode(1) | command(8)]`` == 92, matching
+    :class:`~gear_sonic.lab_teleop.mdp.modal_actions.SonicModalWholeBodyAction`.
+
+    Args:
+        vendor: Body tracker vendor id, or ``None`` for MCAP replay.
+
+    Returns:
+        A zero-argument callable returning the pipeline's ``OutputCombiner``.
+    """
+
+    def _build() -> OutputCombiner:
+        from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
+        from isaacteleop.retargeters import (
+            LocomotionRootCmdRetargeter,
+            LocomotionRootCmdRetargeterConfig,
+            TensorReorderer,
+        )
+
+        from gear_sonic.lab_teleop.retargeters.sonic_command_retargeter import (
+            SONIC_COMMAND_DIM,
+            SonicTeleopCommandRetargeter,
+        )
+
+        if vendor is None:
+            body = FullBodySource(name=BODY_CHANNEL_NAME)
+        else:
+            from isaacteleop.deviceio import TrackerVendor
+
+            body = FullBodySource(name=BODY_CHANNEL_NAME, vendor=TrackerVendor(vendor))
+
+        reference = SonicFullBodyRetargeter(
+            SonicFullBodyRetargeterConfig(), name="sonic_fullbody"
+        ).connect({"full_body": body.output(FullBodySource.FULL_BODY)})
+
+        controllers = ControllersSource(name="controllers")
+        # dt matches the 50 Hz control rate; the retargeter defaults to 1/60, which would
+        # integrate hip height ~17% fast here.
+        root_cmd = LocomotionRootCmdRetargeter(
+            LocomotionRootCmdRetargeterConfig(dt=1.0 / 50.0), name="root_command"
+        ).connect(
+            {
+                "controller_left": controllers.output(ControllersSource.LEFT),
+                "controller_right": controllers.output(ControllersSource.RIGHT),
+            }
+        )
+
+        command = SonicTeleopCommandRetargeter(name="sonic_command").connect(
+            {
+                "root_command": root_cmd.output("root_command"),
+                "controller_left": controllers.output(ControllersSource.LEFT),
+                "sonic_reference": reference.output("sonic_reference"),
+            }
+        )
+
+        ref_names = [f"ref_{i}" for i in range(SONIC_REFERENCE_DIM)]
+        cmd_names = [f"cmd_{i}" for i in range(SONIC_COMMAND_DIM)]
+        reorderer = TensorReorderer(
+            input_config={"sonic_reference": ref_names, "sonic_command": cmd_names},
+            output_order=ref_names + cmd_names,
+            input_types={"sonic_reference": "array", "sonic_command": "array"},
+            name="sonic_modal_action",
+        ).connect(
+            {
+                "sonic_reference": reference.output("sonic_reference"),
+                "sonic_command": command.output(SonicTeleopCommandRetargeter.OUTPUT_NAME),
             }
         )
         return OutputCombiner({"action": reorderer.output("output")})

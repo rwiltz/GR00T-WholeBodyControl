@@ -43,6 +43,7 @@ from gear_sonic.lab_teleop.assets import (
 from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
 from gear_sonic.lab_teleop.assets.g1_sonic import G1_HAND_JOINT_NAMES
 from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
+from gear_sonic.lab_teleop.mdp.modal_actions import SonicModalWholeBodyActionCfg
 
 __all__ = [
     "ANCHOR_ROT_YAW_RIGHT_90",
@@ -52,6 +53,8 @@ __all__ = [
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
     "SonicTeleopG1HandsEnvCfg",
+    "SonicTeleopG1ModalEnvCfg",
+    "SonicTeleopG1ModalReplayEnvCfg",
     "SonicTeleopG1HandsLowLatencyEnvCfg",
     "SonicTeleopG1HandsLowLatencyReplayEnvCfg",
     "SonicTeleopG1HandsReplayEnvCfg",
@@ -434,6 +437,55 @@ class SonicTeleopG1HandsLowLatencyReplayEnvCfg(SonicTeleopG1HandsLowLatencyEnvCf
         )
 
         self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder(vendor=None)
+
+
+@configclass
+class SonicModalActionsCfg:
+    """Mode-switching SONIC action term."""
+
+    sonic = SonicModalWholeBodyActionCfg(
+        asset_name="robot",
+        checkpoint_dir=DEFAULT_CHECKPOINT_DIR,
+        joint_names=list(G1_ISAACLab_ORDER),
+        action_scale=G1_MODEL_12_ACTION_SCALE,
+    )
+
+
+@configclass
+class SonicTeleopG1ModalEnvCfg(SonicTeleopG1EnvCfg):
+    """SONIC teleoperation with operator-switchable encoder mode.
+
+    The left controller's primary click toggles between SONIC's ``smpl`` mode (full-body tracking,
+    the default) and ``teleop`` mode (walk with the thumbsticks), mirroring the real robot's
+    teleop stack. Action layout is ``[sonic_reference(83) | mode(1) | command(8)]`` == 92.
+
+    Requires the velocity planner: ``python download_from_hf.py --low-latency``.
+    """
+
+    actions: SonicModalActionsCfg = SonicModalActionsCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_modal_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_modal_pipeline_builder()
+
+
+@configclass
+class SonicTeleopG1ModalReplayEnvCfg(SonicTeleopG1ModalEnvCfg):
+    """Mode-switching variant wired for MCAP replay."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_modal_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_modal_pipeline_builder(vendor=None)
 
 
 def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:
