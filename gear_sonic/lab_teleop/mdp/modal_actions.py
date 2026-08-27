@@ -48,7 +48,10 @@ from gear_sonic.lab_teleop.mdp.sonic_planner import (
     SONIC_PLANNER_COMMAND_DIM,
     SonicVelocityPlanner,
 )
-from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import SONIC_REFERENCE_DIM
+from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
+    SONIC_REFERENCE_DIM,
+    SonicReferenceSlice,
+)
 
 __all__ = [
     "SONIC_MODAL_ACTION_DIM",
@@ -87,6 +90,20 @@ LOWER_BODY_JOINTS = (
 
 #: Reference frames the ``teleop`` lower-body block spans.
 TELEOP_REFERENCE_FRAMES = 10
+
+#: SMPL joint indices, into the reference's 24-joint **root-local** block, for the three points
+#: ``vr_3point`` carries. Order matches ``GatherVR3PointPosition``: left wrist, right wrist, head.
+#:
+#: The retargeter's ``_SMPL_L_WRIST_IDX = 19`` and friends index the root-*excluded* 21-joint
+#: ``body_pose`` array, so the full-array indices are one higher.
+VR3_SMPL_INDICES = (20, 21, 15)
+
+#: Time constant for smoothing the followed anchor yaw, seconds.
+#:
+#: Matches the shape of Isaac Lab's own ``FOLLOW_PRIM_SMOOTHED`` blend
+#: (``xr_anchor_utils.py:168``). Following raw base yaw would feed per-step gait jitter straight
+#: into the headset.
+ANCHOR_YAW_SMOOTHING_TIME = 0.25
 
 
 @configclass
@@ -149,6 +166,17 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             G1_ISAACLAB_TO_MUJOCO_MAPPING["isaaclab_to_mujoco_dof"], dtype=np.int64
         )
 
+        # Anchor handling. The live XrCfg is the one held by IsaacTeleopCfg, **not** env.cfg.xr:
+        # @configclass copies the latter, so mutating it moves nothing and fails silently.
+        # XrAnchorManager and XrAnchorSynchronizer both store this object by reference, and
+        # sync_headset_to_anchor() reads anchor_pos/anchor_rot from it every frame, so writing
+        # here repositions the operator's frame with no prim writes or carb settings.
+        teleop_cfg = getattr(getattr(env, "cfg", None), "isaac_teleop", None)
+        self._xr_cfg = getattr(teleop_cfg, "xr_cfg", None)
+        self._anchor_z = float(self._xr_cfg.anchor_pos[2]) if self._xr_cfg is not None else 0.0
+        self._anchor_yaw: float | None = None
+        self._prev_mode = ENCODER_MODE_SMPL
+
     @property
     def action_dim(self) -> int:
         """Width of the modal action: reference, mode, locomotion command."""
@@ -171,6 +199,8 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._lower_history[:] = 0.0
         self._prev_lower_pos = None
         self._mode = ENCODER_MODE_SMPL
+        self._prev_mode = ENCODER_MODE_SMPL
+        self._anchor_yaw = None
 
     def _ensure_planner(self) -> SonicVelocityPlanner:
         """Construct the velocity planner on first use.
@@ -186,6 +216,79 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
                 replan_interval=self.cfg.planner_replan_interval,
             )
         return self._planner
+
+    @staticmethod
+    def _yaw_of(quat_wxyz: np.ndarray) -> float:
+        """Yaw about +Z of a wxyz quaternion."""
+        w, x, y, z = (float(v) for v in quat_wxyz)
+        return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+    def _update_anchor(self, mode: int) -> None:
+        """Move the operator's XR anchor according to the active mode.
+
+        Three states, mirroring how ``locomanip_pick_place`` anchors to the robot while it walks:
+
+        * ``smpl`` -- leave the anchor untouched, so it stays wherever it was. Operator
+          displacement then maps one-to-one into the world, which is what drives the gait.
+        * entering ``teleop`` -- snap the anchor to the robot's current pose. Without this the
+          operator would be commanding a robot metres away from their own frame.
+        * ``teleop`` -- follow the robot, so the operator rides along and never walks out of the
+          play space.
+
+        Height is held at its configured value rather than followed: tracking the robot's z would
+        feed the gait's vertical bob into the headset. Yaw is followed alone and smoothed, for the
+        same reason Isaac Lab's own ``FOLLOW_PRIM_SMOOTHED`` does both.
+        """
+        if self._xr_cfg is None or mode != ENCODER_MODE_TELEOP:
+            return
+        from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz
+
+        data = self._asset.data
+        root_pos = data.root_pos_w.torch[0].detach().float().cpu().numpy()
+        base_quat = isaaclab_quat_to_wxyz(data.root_quat_w.torch)[0].detach().float().cpu().numpy()
+        yaw = self._yaw_of(base_quat)
+
+        if self._prev_mode != ENCODER_MODE_TELEOP or self._anchor_yaw is None:
+            self._anchor_yaw = yaw  # snap on entry, no blend from a stale heading
+        else:
+            dt = float(getattr(self._env, "step_dt", 0.02))
+            alpha = 1.0 - float(np.exp(-dt / max(ANCHOR_YAW_SMOOTHING_TIME, 1e-6)))
+            delta = (yaw - self._anchor_yaw + np.pi) % (2.0 * np.pi) - np.pi
+            self._anchor_yaw += float(np.clip(alpha, 0.05, 1.0)) * delta
+
+        half = 0.5 * self._anchor_yaw
+        self._xr_cfg.anchor_pos = (float(root_pos[0]), float(root_pos[1]), self._anchor_z)
+        # XrCfg.anchor_rot is XYZW, not WXYZ (xr_anchor_manager.py:110).
+        self._xr_cfg.anchor_rot = (0.0, 0.0, float(np.sin(half)), float(np.cos(half)))
+
+    def _to_world_directions(self, command: np.ndarray) -> np.ndarray:
+        """Rotate the operator's commanded directions into the world frame.
+
+        The retargeter emits directions in the operator's own frame, because the reference stream
+        is anchor-local: this pipeline declares no ``world_T_anchor`` leaf, so tracker poses are
+        never rebased to world. ``smpl`` mode is unaffected -- ``apply_delta_heading`` is latched
+        at engage and absorbs the offset -- but the planner mixes ``facing_direction`` with a
+        world-frame ``context_mujoco_qpos``, so the two must be expressed alike.
+
+        The conversion uses the latched alignment, which is derived from robot state, and is
+        therefore done here rather than upstream.
+
+        Args:
+            command: ``(8,)`` operator command with directions in the operator frame.
+
+        Returns:
+            A copy with both direction vectors rotated into world.
+        """
+        yaw = self._yaw_of(self._apply_delta_heading[0].detach().float().cpu().numpy())
+        if abs(yaw) < 1e-9:
+            return command
+        cos_y, sin_y = float(np.cos(yaw)), float(np.sin(yaw))
+        out = command.copy()
+        for start in (1, 4):
+            x, y = float(command[start]), float(command[start + 1])
+            out[start] = cos_y * x - sin_y * y
+            out[start + 1] = sin_y * x + cos_y * y
+        return out
 
     def _robot_qpos(self) -> np.ndarray:
         """Measured pose as the planner's 36-wide MuJoCo-order ``qpos``."""
@@ -257,7 +360,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         obs[:, TELEOP_LOWER_BODY] = lower
 
         # Single-frame anchor orientation, same maths as smpl mode over one frame.
-        root_quat = reference[:, None, 73:77]
+        root_quat = reference[:, None, SonicReferenceSlice.ROOT_QUAT]
         anchor = smpl_anchor_orientation(
             reference_root_quat=root_quat,
             robot_base_quat=base_quat,
@@ -266,10 +369,23 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         )
         obs[:, TELEOP_ANCHOR_ORI] = anchor.reshape(1, -1)
 
-        # vr_3point: operator head and hands. Left zero for now -- deriving robot-local targets
-        # needs the anchor handling that is deliberately deferred, and a wrong frame here is a
-        # silent tracking error rather than a loud failure.
-        obs[:, TELEOP_VR3_POS] = 0.0
+        # vr_3point positions: the operator's own wrists and head, relative to their own root.
+        #
+        # "local" here means root-normalized, not robot-relative: ``GatherVR3PointPosition``
+        # subtracts the reference's root position and rotates by the inverse root quaternion
+        # (``g1_deploy_onnx_ref.cpp:1157-1170``). The reference already carries its SMPL joints in
+        # exactly that frame, so the points are a slice rather than a transform.
+        #
+        # No positional offsets are applied. The C++ adds +0.18 along each wrist's X and +0.35 Z
+        # on the torso only when *synthesizing* VR points from a robot skeleton; with real tracked
+        # head and hands it takes the buffered values directly, which is the case here.
+        smpl = reference[:, SonicReferenceSlice.SMPL_JOINTS].reshape(1, 24, 3)
+        obs[:, TELEOP_VR3_POS] = smpl[:, VR3_SMPL_INDICES, :].reshape(1, -1)
+
+        # Orientations are left zero: the 83-wide reference carries only the root quaternion, not
+        # per-joint orientations, so head and hand rotations are not recoverable from it. Filling
+        # these needs the reference format widened, which would break compatibility with existing
+        # MCAP captures -- deliberately out of scope here.
         obs[:, TELEOP_VR3_ORN] = 0.0
 
     def process_actions(self, actions: torch.Tensor) -> None:
@@ -294,7 +410,9 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         command = actions[0, SONIC_REFERENCE_DIM + 1 :].detach().float().cpu().numpy()
         self._mode = mode if mode in (ENCODER_MODE_TELEOP, ENCODER_MODE_SMPL) else ENCODER_MODE_SMPL
 
+        self._update_anchor(self._mode)
         if self._mode == ENCODER_MODE_TELEOP:
+            command = self._to_world_directions(command)
             # Planner runs outside inference_mode: it is numpy/onnxruntime and reads articulation
             # state, which the surrounding context does not need to guard.
             self._advance_planner(command)
@@ -328,3 +446,4 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
                     self._raw_actions.copy_(raw)
                     torch.mul(self._raw_actions, self._scale, out=self._processed_actions)
                     self._processed_actions.add_(self._offset)
+        self._prev_mode = self._mode
