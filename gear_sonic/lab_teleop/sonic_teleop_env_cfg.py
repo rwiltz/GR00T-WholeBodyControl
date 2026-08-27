@@ -44,6 +44,7 @@ from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
 __all__ = [
     "ANCHOR_ROT_YAW_RIGHT_90",
     "DEFAULT_CHECKPOINT_DIR",
+    "PELVIS_ANCHOR_Z_OFFSET",
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
 ]
@@ -55,7 +56,16 @@ __all__ = [
 _SQRT_HALF = 0.7071067811865476
 ANCHOR_ROT_YAW_RIGHT_90 = (0.0, 0.0, -_SQRT_HALF, _SQRT_HALF)
 
-#: Prim path of the G1 pelvis, used as the XR anchor.
+#: Vertical offset from the G1 pelvis down to the operator's floor plane, in metres.
+#:
+#: Retained from the pelvis-anchored configuration so the static anchor lands at the same height
+#: the following anchor had on frame 0. Making this less negative raises the operator relative to
+#: the robot; making it more negative lowers them.
+PELVIS_ANCHOR_Z_OFFSET = -0.95
+
+#: Prim path of the G1 pelvis. No longer used as the XR anchor -- see ``__post_init__`` on why the
+#: anchor is world-fixed for locomotion -- but kept because it documents the ``Geometry/`` nesting
+#: gotcha below, which applies to any prim path taken against this asset.
 #:
 #: Note the ``Geometry/`` segment. Isaac Lab's URDF importer nests links hierarchically under a
 #: ``Geometry`` scope keyed by the URDF root link, whereas the shipped G1 USD that
@@ -190,22 +200,46 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         #
         # Note the SE(3) devices (`--teleop_device keyboard|spacemouse|gamepad`) can NOT drive this
         # env: they emit a 6-DoF delta plus gripper, which cannot express a whole-body pose.
-        from isaaclab_teleop import IsaacTeleopCfg, XrAnchorRotationMode, XrCfg
+        from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
         from gear_sonic.lab_teleop.retargeters import build_sonic_fullbody_pipeline
 
-        # Anchor the operator's XR frame to the robot's pelvis, matching
-        # `isaaclab_tasks.contrib.locomanip_pick_place`. For a mobile humanoid this is what keeps
-        # the operator's frame riding with the robot instead of pinned to world origin: the robot
-        # walks and turns under SONIC, and the operator's reference frame follows it.
+        # Pin the operator's XR frame to the robot's *start* pose; do not let it ride the pelvis.
         #
-        # FOLLOW_PRIM_SMOOTHED tracks the pelvis with smoothing so per-step base jitter is not fed
-        # back into the headset view, and `fixed_anchor_height` holds the anchor at a constant
-        # height so vertical bob during locomotion does not translate into camera motion.
-        self.xr = XrCfg(anchor_pos=(0.0, 0.0, -0.95), anchor_rot=ANCHOR_ROT_YAW_RIGHT_90)
-        self.xr.anchor_prim_path = SONIC_G1_PELVIS_PRIM
-        self.xr.fixed_anchor_height = True
-        self.xr.anchor_rotation_mode = XrAnchorRotationMode.FOLLOW_PRIM_SMOOTHED
+        # Anchoring to the pelvis (as `isaaclab_tasks.contrib.locomanip_pick_place` does) is right
+        # for a stationary manipulator, but it defeats locomotion teleoperation. SONIC walks
+        # because the operator walks, and the operator's displacement is measured *relative to the
+        # anchor*. If the anchor rides the robot, every step the robot takes carries the frame
+        # forward by the same amount, so the operator can never gain ground on it and the
+        # commanded displacement collapses toward zero. A world-fixed anchor makes room-scale
+        # walking map directly to world displacement, which is what SONIC's gait consumes.
+        #
+        # The anchor is placed at exactly the pose the pelvis-relative anchor resolved to on frame
+        # 0, so the operator's initial framing -- eye height and facing -- is unchanged; only the
+        # following behaviour is dropped. The dynamic path composes
+        # ``anchor_world = pelvis_world + anchor_pos`` (``xr_anchor_utils.py:140``), so the
+        # equivalent static world position is the robot's start pose plus that same offset.
+        # Derived from the configured articulation rather than hardcoded, so moving the robot's
+        # spawn keeps the anchor with it.
+        start_pos = self.scene.robot.init_state.pos
+        self.xr = XrCfg(
+            anchor_pos=(
+                start_pos[0],
+                start_pos[1],
+                start_pos[2] + PELVIS_ANCHOR_Z_OFFSET,
+            ),
+            anchor_rot=ANCHOR_ROT_YAW_RIGHT_90,
+        )
+        # `anchor_prim_path` deliberately left None: the anchor prim is then created under
+        # `/World` instead of as a child of `SONIC_G1_PELVIS_PRIM`, and is never re-synced to a
+        # moving prim (`xr_anchor_manager.py:95-101`). `fixed_anchor_height` and
+        # `anchor_rotation_mode` are consulted only on the prim-following branch
+        # (`xr_anchor_utils.py:135` and below), so they are inert here and left unset.
+        #
+        # This assumes the robot spawns with identity rotation, which it does -- the static branch
+        # applies `anchor_rot` as an absolute world orientation with no prim rotation to compose
+        # against, so ANCHOR_ROT_YAW_RIGHT_90 reproduces the current frame-0 facing exactly. A
+        # non-identity spawn rotation would need composing in here.
 
         self.isaac_teleop = IsaacTeleopCfg(
             pipeline_builder=build_sonic_fullbody_pipeline,
