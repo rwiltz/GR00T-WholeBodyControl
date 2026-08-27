@@ -78,7 +78,11 @@ DEFAULT_CHECKPOINT_DIR = str(
 class SonicTeleopSceneCfg(InteractiveSceneCfg):
     """Ground, light, and SONIC's G1. Nothing task-specific."""
 
-    ground = AssetBaseCfg(prim_path="/World/GroundPlane", spawn=GroundPlaneCfg())
+    # ``visible=False`` hides the plane from the renderer but still spawns the collider, so the
+    # robot has something to stand on. Dropping the asset entirely would let it fall through.
+    ground = AssetBaseCfg(
+        prim_path="/World/GroundPlane", spawn=GroundPlaneCfg(visible=False)
+    )
 
     light = AssetBaseCfg(
         prim_path="/World/Light",
