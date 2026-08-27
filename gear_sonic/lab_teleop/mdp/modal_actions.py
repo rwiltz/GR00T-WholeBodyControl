@@ -188,6 +188,12 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         teleop_cfg = getattr(getattr(env, "cfg", None), "isaac_teleop", None)
         self._xr_cfg = getattr(teleop_cfg, "xr_cfg", None)
         self._anchor_z = float(self._xr_cfg.anchor_pos[2]) if self._xr_cfg is not None else 0.0
+        # Captured so reset can put the operator back where the episode started. Without this the
+        # anchor stays wherever teleop mode last dragged it, and because reset also returns the
+        # mode to smpl it then stays there: the robot respawns at the origin while the operator is
+        # left standing metres away looking at empty floor, which reads as "reset did nothing".
+        self._initial_anchor_pos = tuple(self._xr_cfg.anchor_pos) if self._xr_cfg else None
+        self._initial_anchor_rot = tuple(self._xr_cfg.anchor_rot) if self._xr_cfg else None
         self._anchor_yaw: float | None = None
         self._prev_mode = ENCODER_MODE_SMPL
         #: ``None`` until the first action arrives, so the first frame always applies and logs.
@@ -217,6 +223,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._mode = ENCODER_MODE_SMPL
         self._prev_mode = ENCODER_MODE_SMPL
         self._anchor_yaw = None
+        self._restore_anchor()
         self._qpos_history[:] = 0.0
         self._qpos_seeded = False
         self._ground_visible = None
@@ -276,6 +283,24 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         """Yaw about +Z of a wxyz quaternion."""
         w, x, y, z = (float(v) for v in quat_wxyz)
         return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+    def _restore_anchor(self) -> None:
+        """Return the XR anchor to the pose it had when the episode began.
+
+        Called on reset. The robot respawns at its initial pose, so the operator's frame has to as
+        well -- otherwise the two are separated by however far the robot travelled before the
+        reset, which looks from inside the headset like the reset did not happen.
+        """
+        if self._xr_cfg is None or self._initial_anchor_pos is None:
+            return
+        moved = tuple(self._xr_cfg.anchor_pos) != self._initial_anchor_pos
+        self._xr_cfg.anchor_pos = self._initial_anchor_pos
+        self._xr_cfg.anchor_rot = self._initial_anchor_rot
+        if moved:
+            print(
+                f"[SONIC] reset: XR anchor restored to {self._initial_anchor_pos}",
+                flush=True,
+            )
 
     def _update_anchor(self, mode: int) -> None:
         """Move the operator's XR anchor according to the active mode.
