@@ -57,6 +57,7 @@ __all__ = [
     "STEERING_WHEEL_Z",
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
+    "SonicTeleopG1LowLatencyBareEnvCfg",
     "SonicTeleopG1LowLatencyEnvCfg",
     "SonicTeleopG1LowLatencyReplayEnvCfg",
     "SonicTeleopG1ReplayEnvCfg",
@@ -419,6 +420,30 @@ class SonicModalActionsCfg:
         joint_names=list(G1_ISAACLab_ORDER),
         action_scale=G1_MODEL_12_ACTION_SCALE,
     )
+
+
+@configclass
+class SonicTeleopG1LowLatencyBareEnvCfg(SonicTeleopG1LowLatencyEnvCfg):
+    """Low-latency environment with the manipulation props removed.
+
+    Same robot, controls and modes as :class:`SonicTeleopG1LowLatencyEnvCfg`; only the scene
+    dressing differs. The packing table brings crates, boxes, a container and their 1k PBR texture
+    sets with it, which measured ~7.7 ms per frame -- replay runs at ~30.4 ms and 33 fps with the
+    props against ~22.7 ms and 44 fps without. That headroom matters for a headset, and the props
+    are irrelevant when the task is locomotion or gait tuning rather than manipulation.
+
+    Removing them also drops the dependency on the Omniverse content bucket, so this variant
+    starts faster on a cold machine and works offline.
+
+    ``InteractiveScene`` skips entries whose config is ``None`` (``interactive_scene.py:796``), so
+    nulling the fields is the supported way to drop an inherited asset rather than redeclaring the
+    scene.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.packing_table = None
+        self.scene.steering_wheel = None
 
 
 def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:
