@@ -8,13 +8,13 @@ Wires the XR full-body tracker to :class:`SonicFullBodyRetargeter` and exposes t
 pipeline's ``"action"`` output, which is what ``IsaacTeleopDevice.advance()`` returns and what the
 teleop runner feeds to ``env.step()``.
 
-Pass :func:`build_sonic_fullbody_pipeline` as the ``pipeline_builder`` of an
+Pass :func:`make_sonic_full_pipeline_builder` as the ``pipeline_builder`` of an
 ``isaaclab_teleop.IsaacTeleopCfg``::
 
     from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
     self.isaac_teleop = IsaacTeleopCfg(
-        pipeline_builder=build_sonic_fullbody_pipeline,
+        pipeline_builder=make_sonic_full_pipeline_builder(),
         sim_device=self.sim.device,
         xr_cfg=self.xr,
     )
@@ -43,11 +43,8 @@ from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
 
 __all__ = [
     "DEFAULT_BODY_TRACKER_VENDOR",
-    "build_sonic_fullbody_pipeline",
-    "build_sonic_fullbody_replay_pipeline",
     "make_sonic_fullbody_pipeline_builder",
-    "make_sonic_hands_pipeline_builder",
-    "make_sonic_modal_pipeline_builder",
+    "make_sonic_full_pipeline_builder",
 ]
 
 #: DeviceIO vendor string for PICO body tracking (``XR_BD_body_tracking``).
@@ -104,47 +101,29 @@ def make_sonic_fullbody_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACK
     return _build
 
 
-def build_sonic_fullbody_pipeline() -> OutputCombiner:
-    """Live-session pipeline: XR full-body tracking -> SONIC reference.
+def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_VENDOR):
+    """The complete SONIC teleoperation graph: tracking, hands, and mode selection.
 
-    Returns:
-        An ``OutputCombiner`` whose single ``"action"`` output is the 83-wide SONIC reference
-        frame described in :mod:`~gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter`.
-    """
-    return make_sonic_fullbody_pipeline_builder()()
+    One pipeline rather than a variant per capability. Hand grasping and mode switching are things
+    an operator wants together, so they are not selectable at task-id level; the only axis that
+    changes behaviour is the SONIC checkpoint::
 
+        ControllersSource -+-> TriHandMotionControllerRetargeter (x2) ------------+
+                           |                                                      |
+                           +-> LocomotionRootCmdRetargeter -> SonicTeleopCommand --+
+                                                                                  |
+        FullBodySource -> SonicFullBodyRetargeter ----------------------------+---+-> TensorReorderer
 
-def build_sonic_fullbody_replay_pipeline() -> OutputCombiner:
-    """MCAP-replay pipeline: identical graph, but with no vendor selection.
+    Controls: **trigger** pinches (index + thumb), **squeeze** grasps (middle + thumb), and the
+    left **primary click** toggles between full-body tracking and stick-driven walking.
 
-    Use with ``IsaacTeleopCfg`` when the teleop session runs in ``SessionMode.REPLAY``, so an
-    end-to-end environment test can be driven from a recording with no headset attached.
-    """
-    return make_sonic_fullbody_pipeline_builder(vendor=None)()
+    Action layout, matching the action-term declaration order in ``SonicActionsCfg``::
 
+        [ sonic_reference(83) | mode(1) | locomotion_command(8) | left_hand(7) | right_hand(7) ]
 
-def make_sonic_hands_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_VENDOR):
-    """Full-body reference **plus** controller-driven hands.
-
-    Extends the base graph with a controller branch per side::
-
-        ControllersSource -> TriHandMotionControllerRetargeter --+
-                                                                 |
-        FullBodySource -> SonicFullBodyRetargeter ---------------+-> TensorReorderer
-
-    The generic tri-hand retargeter maps trigger to index+thumb (pinch) and squeeze to
-    middle+thumb (grasp).
-
-    No sign adaptation sits in between, which is worth recording because the joint limits invite
-    the opposite conclusion: this URDF's hands are *not* mirrored (left ``index_0`` travels
-    ``[-1.571, 0]`` while right travels ``[0, +1.571]``), so the generic output looks like it
-    would drive the left hand into its zero bound. It does not --
-    ``TriHandMotionControllerRetargeter._compute_fn`` already negates the whole vector for the
-    left side, and every one of the 14 joints then lands inside its travel range. A correction
-    node here would be a no-op.
-
-    The action is ordered ``[sonic_reference(83) | left_hand(7) | right_hand(7)]`` == 97 to match
-    the action-term order in ``SonicHandsActionsCfg``.
+    == 106. Only operator-derived quantities are computed here; the velocity planner that turns
+    the locomotion command into a lower-body reference is closed-loop on the robot and lives in
+    the action term.
 
     Args:
         vendor: Body tracker vendor id, or ``None`` for MCAP replay.
@@ -155,97 +134,13 @@ def make_sonic_hands_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_
 
     def _build() -> OutputCombiner:
         from isaacteleop.retargeters import (
+            LocomotionRootCmdRetargeter,
+            LocomotionRootCmdRetargeterConfig,
             TensorReorderer,
             TriHandMotionControllerConfig,
             TriHandMotionControllerRetargeter,
         )
         from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
-
-        if vendor is None:
-            body = FullBodySource(name=BODY_CHANNEL_NAME)
-        else:
-            from isaacteleop.deviceio import TrackerVendor
-
-            body = FullBodySource(name=BODY_CHANNEL_NAME, vendor=TrackerVendor(vendor))
-
-        reference = SonicFullBodyRetargeter(
-            SonicFullBodyRetargeterConfig(), name="sonic_fullbody"
-        ).connect({"full_body": body.output(FullBodySource.FULL_BODY)})
-
-        controllers = ControllersSource(name="controllers")
-        hand_outputs = {}
-        for side, source_key in (
-            ("left", ControllersSource.LEFT),
-            ("right", ControllersSource.RIGHT),
-        ):
-            trihand = TriHandMotionControllerRetargeter(
-                TriHandMotionControllerConfig(
-                    hand_joint_names=list(_TRIHAND_SLOT_NAMES), controller_side=side
-                ),
-                name=f"trihand_{side}",
-            ).connect({f"controller_{side}": controllers.output(source_key)})
-            hand_outputs[side] = trihand.output("hand_joints")
-
-        reorderer = TensorReorderer(
-            input_config={
-                "sonic_reference": [f"ref_{i}" for i in range(SONIC_REFERENCE_DIM)],
-                "left_hand": [f"l_{n}" for n in _TRIHAND_SLOT_NAMES],
-                "right_hand": [f"r_{n}" for n in _TRIHAND_SLOT_NAMES],
-            },
-            output_order=(
-                [f"ref_{i}" for i in range(SONIC_REFERENCE_DIM)]
-                + [f"l_{n}" for n in _TRIHAND_SLOT_NAMES]
-                + [f"r_{n}" for n in _TRIHAND_SLOT_NAMES]
-            ),
-            # The reference arrives as one 83-wide NDArray; the tri-hand outputs are groups of
-            # scalar floats. TensorReorderer defaults every input to "scalar", so the reference
-            # must be declared explicitly or it expects 83 separate tensors.
-            input_types={"sonic_reference": "array"},
-            name="sonic_hands_action",
-        ).connect(
-            {
-                "sonic_reference": reference.output("sonic_reference"),
-                "left_hand": hand_outputs["left"],
-                "right_hand": hand_outputs["right"],
-            }
-        )
-        return OutputCombiner({"action": reorderer.output("output")})
-
-    return _build
-
-
-def make_sonic_modal_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_VENDOR):
-    """Full-body reference plus operator mode selection and a locomotion command.
-
-    Adds the controller branch that lets the operator switch between SONIC's ``smpl`` (full-body
-    tracking) and ``teleop`` (stick-driven walking) encoder modes::
-
-        ControllersSource -> LocomotionRootCmdRetargeter --+
-                                                           +-> SonicTeleopCommandRetargeter --+
-        FullBodySource -> SonicFullBodyRetargeter ---------+----------------------------------+
-                                                                                              |
-                                                                                    TensorReorderer
-
-    Only operator-derived quantities are computed here. The velocity planner that turns the
-    command into a lower-body reference is closed-loop on the robot and lives in the action term.
-
-    Action layout is ``[sonic_reference(83) | mode(1) | command(8)]`` == 92, matching
-    :class:`~gear_sonic.lab_teleop.mdp.modal_actions.SonicModalWholeBodyAction`.
-
-    Args:
-        vendor: Body tracker vendor id, or ``None`` for MCAP replay.
-
-    Returns:
-        A zero-argument callable returning the pipeline's ``OutputCombiner``.
-    """
-
-    def _build() -> OutputCombiner:
-        from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
-        from isaacteleop.retargeters import (
-            LocomotionRootCmdRetargeter,
-            LocomotionRootCmdRetargeterConfig,
-            TensorReorderer,
-        )
 
         from gear_sonic.lab_teleop.retargeters.sonic_command_retargeter import (
             SONIC_COMMAND_DIM,
@@ -264,8 +159,25 @@ def make_sonic_modal_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_
         ).connect({"full_body": body.output(FullBodySource.FULL_BODY)})
 
         controllers = ControllersSource(name="controllers")
-        # dt matches the 50 Hz control rate; the retargeter defaults to 1/60, which would
-        # integrate hip height ~17% fast here.
+
+        hands = {}
+        for side, source_key in (
+            ("left", ControllersSource.LEFT),
+            ("right", ControllersSource.RIGHT),
+        ):
+            hands[side] = (
+                TriHandMotionControllerRetargeter(
+                    TriHandMotionControllerConfig(
+                        hand_joint_names=list(_TRIHAND_SLOT_NAMES), controller_side=side
+                    ),
+                    name=f"trihand_{side}",
+                )
+                .connect({f"controller_{side}": controllers.output(source_key)})
+                .output("hand_joints")
+            )
+
+        # dt matches the 50 Hz control rate; the retargeter's 1/60 default would integrate hip
+        # height ~17% fast here.
         root_cmd = LocomotionRootCmdRetargeter(
             LocomotionRootCmdRetargeterConfig(dt=1.0 / 50.0), name="root_command"
         ).connect(
@@ -274,7 +186,6 @@ def make_sonic_modal_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_
                 "controller_right": controllers.output(ControllersSource.RIGHT),
             }
         )
-
         command = SonicTeleopCommandRetargeter(name="sonic_command").connect(
             {
                 "root_command": root_cmd.output("root_command"),
@@ -285,15 +196,26 @@ def make_sonic_modal_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_
 
         ref_names = [f"ref_{i}" for i in range(SONIC_REFERENCE_DIM)]
         cmd_names = [f"cmd_{i}" for i in range(SONIC_COMMAND_DIM)]
+        left_names = [f"l_{n}" for n in _TRIHAND_SLOT_NAMES]
+        right_names = [f"r_{n}" for n in _TRIHAND_SLOT_NAMES]
         reorderer = TensorReorderer(
-            input_config={"sonic_reference": ref_names, "sonic_command": cmd_names},
-            output_order=ref_names + cmd_names,
+            input_config={
+                "sonic_reference": ref_names,
+                "sonic_command": cmd_names,
+                "left_hand": left_names,
+                "right_hand": right_names,
+            },
+            output_order=ref_names + cmd_names + left_names + right_names,
+            # The reference and command are single NDArrays; the tri-hand outputs are groups of
+            # scalar floats, which is TensorReorderer's default.
             input_types={"sonic_reference": "array", "sonic_command": "array"},
-            name="sonic_modal_action",
+            name="sonic_full_action",
         ).connect(
             {
                 "sonic_reference": reference.output("sonic_reference"),
                 "sonic_command": command.output(SonicTeleopCommandRetargeter.OUTPUT_NAME),
+                "left_hand": hands["left"],
+                "right_hand": hands["right"],
             }
         )
         return OutputCombiner({"action": reorderer.output("output")})

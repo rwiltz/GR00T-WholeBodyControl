@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 from isaacteleop.retargeting_engine.interface import BaseRetargeter, RetargeterIOType
 from isaacteleop.retargeting_engine.interface.retargeter_core_types import RetargeterIO
 from isaacteleop.retargeting_engine.interface.tensor_group_type import (
@@ -59,6 +58,7 @@ from isaacteleop.retargeting_engine.tensor_types import (
     DLDataType,
     NDArrayType,
 )
+import numpy as np
 
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,

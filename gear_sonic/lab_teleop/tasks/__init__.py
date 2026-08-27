@@ -36,37 +36,6 @@ SONIC_TELEOP_G1_LOW_LATENCY_REPLAY_TASK_ID = (
 )
 """MCAP-replay id for the low-latency checkpoint."""
 
-SONIC_TELEOP_G1_HANDS_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-Hands-v0"
-"""Live-headset id adding controller-driven tri-hand grasping (trigger pinch, squeeze grasp)."""
-
-SONIC_TELEOP_G1_HANDS_REPLAY_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-Hands-Replay-v0"
-"""MCAP-replay id for the hands variant."""
-
-SONIC_TELEOP_G1_MODAL_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-Modal-v0"
-"""Live-headset id with operator-switchable encoder mode (full-body tracking vs stick walking)."""
-
-SONIC_TELEOP_G1_MODAL_REPLAY_TASK_ID = "IsaacContrib-Teleop-Sonic-WholeBody-G1-Modal-Replay-v0"
-"""MCAP-replay id for the mode-switching variant."""
-
-SONIC_TELEOP_G1_MODAL_LOW_LATENCY_TASK_ID = (
-    "IsaacContrib-Teleop-Sonic-WholeBody-G1-Modal-LowLatency-v0"
-)
-"""Live-headset id: mode switching plus the low-latency checkpoint."""
-
-SONIC_TELEOP_G1_MODAL_LOW_LATENCY_REPLAY_TASK_ID = (
-    "IsaacContrib-Teleop-Sonic-WholeBody-G1-Modal-LowLatency-Replay-v0"
-)
-"""MCAP-replay id for the low-latency mode-switching variant."""
-
-SONIC_TELEOP_G1_HANDS_LOW_LATENCY_TASK_ID = (
-    "IsaacContrib-Teleop-Sonic-WholeBody-G1-Hands-LowLatency-v0"
-)
-"""Live-headset id: controller-driven hands plus the low-latency SONIC checkpoint."""
-
-SONIC_TELEOP_G1_HANDS_LOW_LATENCY_REPLAY_TASK_ID = (
-    "IsaacContrib-Teleop-Sonic-WholeBody-G1-Hands-LowLatency-Replay-v0"
-)
-"""MCAP-replay id for the low-latency hands variant."""
 
 gym.register(
     id=SONIC_TELEOP_G1_TASK_ID,
@@ -110,103 +79,7 @@ gym.register(
     disable_env_checker=True,
 )
 
-gym.register(
-    id=SONIC_TELEOP_G1_HANDS_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1HandsEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_HANDS_REPLAY_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1HandsReplayEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_HANDS_LOW_LATENCY_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1HandsLowLatencyEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_HANDS_LOW_LATENCY_REPLAY_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:" "SonicTeleopG1HandsLowLatencyReplayEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_MODAL_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1ModalEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_MODAL_REPLAY_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1ModalReplayEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_MODAL_LOW_LATENCY_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1ModalLowLatencyEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
-gym.register(
-    id=SONIC_TELEOP_G1_MODAL_LOW_LATENCY_REPLAY_TASK_ID,
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={
-        "env_cfg_entry_point": (
-            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:" "SonicTeleopG1ModalLowLatencyReplayEnvCfg"
-        ),
-    },
-    disable_env_checker=True,
-)
-
 __all__ = [
-    "SONIC_TELEOP_G1_HANDS_LOW_LATENCY_REPLAY_TASK_ID",
-    "SONIC_TELEOP_G1_HANDS_LOW_LATENCY_TASK_ID",
-    "SONIC_TELEOP_G1_HANDS_REPLAY_TASK_ID",
-    "SONIC_TELEOP_G1_HANDS_TASK_ID",
-    "SONIC_TELEOP_G1_MODAL_LOW_LATENCY_REPLAY_TASK_ID",
-    "SONIC_TELEOP_G1_MODAL_LOW_LATENCY_TASK_ID",
-    "SONIC_TELEOP_G1_MODAL_REPLAY_TASK_ID",
-    "SONIC_TELEOP_G1_MODAL_TASK_ID",
     "SONIC_TELEOP_G1_LOW_LATENCY_REPLAY_TASK_ID",
     "SONIC_TELEOP_G1_LOW_LATENCY_TASK_ID",
     "SONIC_TELEOP_G1_REPLAY_TASK_ID",

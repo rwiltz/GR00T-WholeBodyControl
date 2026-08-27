@@ -42,8 +42,6 @@ from isaaclab.assets.articulation import ArticulationCfg
 
 from gear_sonic.envs.manager_env.robots.g1 import (
     G1_CYLINDER_MODEL_12_DEX_CFG as _UPSTREAM_CFG,
-)
-from gear_sonic.envs.manager_env.robots.g1 import (
     G1_ISAACLAB_TO_MUJOCO_MAPPING,
     G1_MODEL_12_ACTION_SCALE,
 )

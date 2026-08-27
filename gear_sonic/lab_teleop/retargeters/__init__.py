@@ -5,8 +5,7 @@
 """Isaac Teleop retargeters producing SONIC reference frames."""
 
 from gear_sonic.lab_teleop.retargeters.pipeline import (
-    build_sonic_fullbody_pipeline,
-    build_sonic_fullbody_replay_pipeline,
+    make_sonic_full_pipeline_builder,
     make_sonic_fullbody_pipeline_builder,
 )
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
@@ -21,7 +20,6 @@ __all__ = [
     "SonicFullBodyRetargeter",
     "SonicFullBodyRetargeterConfig",
     "SonicReferenceSlice",
-    "build_sonic_fullbody_pipeline",
-    "build_sonic_fullbody_replay_pipeline",
+    "make_sonic_full_pipeline_builder",
     "make_sonic_fullbody_pipeline_builder",
 ]

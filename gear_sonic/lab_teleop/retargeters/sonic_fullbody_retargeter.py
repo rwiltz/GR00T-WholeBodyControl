@@ -46,11 +46,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import pathlib
 
-import numpy as np
-from scipy.spatial.transform import Rotation as sRot
-import torch
-
-from isaacteleop.retargeting_engine.deviceio_source_nodes import FullBodySource
 from isaacteleop.retargeting_engine.interface import BaseRetargeter, RetargeterIOType
 from isaacteleop.retargeting_engine.interface.retargeter_core_types import RetargeterIO
 from isaacteleop.retargeting_engine.interface.tensor_group_type import (
@@ -63,6 +58,9 @@ from isaacteleop.retargeting_engine.tensor_types import (
     FullBodyInputIndex,
     NDArrayType,
 )
+import numpy as np
+from scipy.spatial.transform import Rotation as sRot
+import torch
 
 from gear_sonic.isaac_utils.rotations import remove_smpl_base_rot, smpl_root_ytoz_up
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa

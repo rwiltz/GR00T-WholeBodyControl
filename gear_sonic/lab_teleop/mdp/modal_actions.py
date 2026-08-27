@@ -37,9 +37,9 @@ Isaac Teleop supplies only the operator's mode selection and 8-scalar command; s
 
 from __future__ import annotations
 
+from isaaclab.utils.configclass import configclass
 import numpy as np
 import torch
-from isaaclab.utils.configclass import configclass
 
 from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyAction, SonicWholeBodyActionCfg
 from gear_sonic.lab_teleop.mdp.sonic_planner import (
@@ -124,11 +124,12 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             / "V2"
             / "planner_sonic.onnx"
         )
-        self._planner = SonicVelocityPlanner(
-            checkpoint_path=checkpoint,
-            device=self._policy_device,
-            replan_interval=cfg.planner_replan_interval,
-        )
+        # Constructed lazily on first entry to teleop mode. The planner's onnxruntime session
+        # costs ~1 GB of GPU memory, and an operator who never leaves full-body tracking should
+        # not pay for it -- which is what lets mode switching live in every environment rather
+        # than in a separate variant.
+        self._planner_checkpoint = checkpoint
+        self._planner: SonicVelocityPlanner | None = None
         self._planner_clip = int(cfg.planner_clip)
 
         lower_ids, _ = self._asset.find_joints(list(LOWER_BODY_JOINTS), preserve_order=True)
@@ -165,10 +166,26 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         episode's gait, and its context conditions the next plan on a pose the robot no longer has.
         """
         super().reset(env_ids)
-        self._planner.reset()
+        if self._planner is not None:
+            self._planner.reset()
         self._lower_history[:] = 0.0
         self._prev_lower_pos = None
         self._mode = ENCODER_MODE_SMPL
+
+    def _ensure_planner(self) -> SonicVelocityPlanner:
+        """Construct the velocity planner on first use.
+
+        Raises:
+            FileNotFoundError: If the planner graph is absent. Raised here rather than at env
+                construction so environments that never enter teleop mode do not require it.
+        """
+        if self._planner is None:
+            self._planner = SonicVelocityPlanner(
+                checkpoint_path=self._planner_checkpoint,
+                device=self._policy_device,
+                replan_interval=self.cfg.planner_replan_interval,
+            )
+        return self._planner
 
     def _robot_qpos(self) -> np.ndarray:
         """Measured pose as the planner's 36-wide MuJoCo-order ``qpos``."""
@@ -187,20 +204,21 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
 
     def _advance_planner(self, command: np.ndarray) -> None:
         """Run the planner and push one frame of lower-body pos+vel into the history."""
+        planner = self._ensure_planner()
         qpos = self._robot_qpos()
-        self._planner.push_state(qpos)
+        planner.push_state(qpos)
 
         if float(command[0]) <= 1e-4:
             # No operator input: continue from measured motion rather than a stale command, as the
             # reference implementation does. Needs robot state, hence here rather than upstream.
             movement, facing = SonicVelocityPlanner.idle_directions(
-                self._planner._context[0]  # noqa: SLF001 - deliberate: the measured history
+                planner._context[0]  # noqa: SLF001 - deliberate: the measured history
             )
             command = command.copy()
             command[1:4] = movement
             command[4:7] = facing
 
-        frame = self._planner.next_frame(command, mode=self._planner_clip)
+        frame = planner.next_frame(command, mode=self._planner_clip)
         # Planned joints are MuJoCo-ordered; take the lower body back in Isaac Lab order.
         planned_joints = frame[7:][self._isaaclab_to_mujoco]
         lower_pos = planned_joints[: len(LOWER_BODY_JOINTS)]

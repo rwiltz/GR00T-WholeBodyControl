@@ -29,8 +29,8 @@ import torch
 sys.modules.setdefault("zmq", mock.MagicMock())
 
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (  # noqa: E402
-    SONIC_REFERENCE_DIM,
     _SMPL_PARENT_INDICES,
+    SONIC_REFERENCE_DIM,
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
     SonicReferenceSlice,
@@ -140,9 +140,9 @@ def test_zeros_before_first_good_frame() -> None:
 
 def test_pipeline_builds() -> None:
     """The retargeting graph wires up and exposes a single ``action`` output."""
-    from gear_sonic.lab_teleop.retargeters.pipeline import build_sonic_fullbody_pipeline
+    from gear_sonic.lab_teleop.retargeters.pipeline import make_sonic_full_pipeline_builder
 
-    combiner = build_sonic_fullbody_pipeline()
+    combiner = make_sonic_full_pipeline_builder()()
     mapping = getattr(combiner, "_output_mapping", None) or getattr(
         combiner, "output_mapping", {}
     )

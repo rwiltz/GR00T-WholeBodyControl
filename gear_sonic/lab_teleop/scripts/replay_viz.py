@@ -43,13 +43,12 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # ruff: noqa: E402  -- Isaac Sim requires the app to launch before these imports resolve.
-import numpy as np
-import torch
-
 from isaaclab.assets import Articulation, AssetBaseCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab.sim import SimulationCfg, SimulationContext
+import numpy as np
+import torch
 
 from gear_sonic.lab_teleop.assets import make_g1_sonic_cfg
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (

@@ -63,10 +63,9 @@ simulation_app = app_launcher.app
 # ruff: noqa: E402  -- Isaac Sim must launch before these resolve.
 import time
 
+from isaaclab.envs import ManagerBasedRLEnv
 import numpy as np
 import torch
-
-from isaaclab.envs import ManagerBasedRLEnv
 
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SonicFullBodyRetargeter,
@@ -85,9 +84,7 @@ def _load_replay_references(path: str, channel: str) -> np.ndarray:
     frames = read_body_frames(path, channel)
     if not frames:
         raise SystemExit(f"No valid body-tracking frames in {path}")
-    retargeter = SonicFullBodyRetargeter(
-        SonicFullBodyRetargeterConfig(device="cpu"), name="replay"
-    )
+    retargeter = SonicFullBodyRetargeter(SonicFullBodyRetargeterConfig(device="cpu"), name="replay")
     references = np.stack([retargeter._retarget(f) for f in frames])  # noqa: SLF001
     print(f"[sonic-teleop] retargeted {len(references)} frames from {path}")
     return references
@@ -123,11 +120,11 @@ def main() -> None:
     if args_cli.live:
         from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
-        from gear_sonic.lab_teleop.retargeters import build_sonic_fullbody_pipeline
+        from gear_sonic.lab_teleop.retargeters import make_sonic_full_pipeline_builder
 
         env_cfg.xr = XrCfg(anchor_pos=(0.0, 0.0, 0.0), anchor_rot=(1.0, 0.0, 0.0, 0.0))
         env_cfg.isaac_teleop = IsaacTeleopCfg(
-            pipeline_builder=build_sonic_fullbody_pipeline,
+            pipeline_builder=make_sonic_full_pipeline_builder(),
             sim_device=env_cfg.sim.device,
             xr_cfg=env_cfg.xr,
         )
@@ -145,9 +142,7 @@ def main() -> None:
         teleop_device = IsaacTeleopDevice(env_cfg.isaac_teleop, env=env)
         print("[sonic-teleop] waiting for the headset to connect...")
 
-    playback_order = (
-        None if references is None else _build_playback_order(len(references))
-    )
+    playback_order = None if references is None else _build_playback_order(len(references))
 
     obs, _ = env.reset()
     step = 0
@@ -171,9 +166,7 @@ def main() -> None:
                         break
                     index = 0
                 actions = (
-                    torch.from_numpy(references[playback_order[index]])
-                    .to(env.device)
-                    .unsqueeze(0)
+                    torch.from_numpy(references[playback_order[index]]).to(env.device).unsqueeze(0)
                 )
                 index += 1
 
@@ -183,10 +176,7 @@ def main() -> None:
             if step % 100 == 0:
                 rate = step / (time.perf_counter() - started)
                 height = float(env.scene["robot"].data.root_pos_w.torch[0, 2])
-                print(
-                    f"[sonic-teleop] step {step:6d}  {rate:5.1f} Hz  "
-                    f"pelvis z={height:.3f} m"
-                )
+                print(f"[sonic-teleop] step {step:6d}  {rate:5.1f} Hz  " f"pelvis z={height:.3f} m")
 
     print(f"[sonic-teleop] ran {step} steps")
     env.close()

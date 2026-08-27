@@ -13,36 +13,37 @@ Timing matches both SONIC and the reference locomanip environment: ``sim.dt = 1/
 ``decimation = 4`` gives a 50 Hz control rate, which is exactly SONIC's ``control_dt_ = 0.02``.
 
 Attach teleop by pointing ``IsaacTeleopCfg.pipeline_builder`` at
-:func:`~gear_sonic.lab_teleop.retargeters.pipeline.build_sonic_fullbody_pipeline` for a live
-headset, or :func:`~gear_sonic.lab_teleop.retargeters.pipeline.build_sonic_fullbody_replay_pipeline`
-together with ``SessionMode.REPLAY`` to drive it from a recorded MCAP.
+:func:`~gear_sonic.lab_teleop.retargeters.pipeline.make_sonic_full_pipeline_builder` for a live
+headset, or the same builder with ``vendor=None`` together with ``SessionMode.REPLAY`` to drive it
+from a recorded MCAP.
 """
 
 from __future__ import annotations
 
 import pathlib
 
-import isaaclab.envs.mdp as base_mdp
+from isaaclab.assets import AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
+import isaaclab.envs.mdp as base_mdp
+from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
+from isaaclab.managers import (
+    ObservationGroupCfg as ObsGroup,
+    ObservationTermCfg as ObsTerm,
+    SceneEntityCfg,
+    TerminationTermCfg as DoneTerm,
+)
 from isaaclab.scene import InteractiveSceneCfg
 import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
-from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
 from isaaclab.utils.configclass import configclass
 
+from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
 from gear_sonic.lab_teleop.assets import (
     G1_MODEL_12_ACTION_SCALE,
     make_g1_sonic_cfg,
     repo_root,
 )
-from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
 from gear_sonic.lab_teleop.assets.g1_sonic import G1_HAND_JOINT_NAMES
-from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyActionCfg
 from gear_sonic.lab_teleop.mdp.modal_actions import SonicModalWholeBodyActionCfg
 
 __all__ = [
@@ -52,14 +53,6 @@ __all__ = [
     "PELVIS_ANCHOR_Z_OFFSET",
     "SONIC_G1_PELVIS_PRIM",
     "SonicTeleopG1EnvCfg",
-    "SonicTeleopG1HandsEnvCfg",
-    "SonicTeleopG1ModalEnvCfg",
-    "SonicTeleopG1ModalLowLatencyEnvCfg",
-    "SonicTeleopG1ModalLowLatencyReplayEnvCfg",
-    "SonicTeleopG1ModalReplayEnvCfg",
-    "SonicTeleopG1HandsLowLatencyEnvCfg",
-    "SonicTeleopG1HandsLowLatencyReplayEnvCfg",
-    "SonicTeleopG1HandsReplayEnvCfg",
     "SonicTeleopG1LowLatencyEnvCfg",
     "SonicTeleopG1LowLatencyReplayEnvCfg",
     "SonicTeleopG1ReplayEnvCfg",
@@ -129,11 +122,25 @@ class SonicActionsCfg:
 
     # Named explicitly rather than ".*": the articulation is 43 DoF since the URDF's 14 finger
     # joints were un-welded for hand teleoperation, and SONIC drives only its own 29.
-    sonic = SonicWholeBodyActionCfg(
+    #
+    # The modal term is the default rather than a variant. Mode switching and hand grasping are
+    # capabilities an operator wants together, not alternatives to choose between at task-id
+    # level, and the real robot's teleop stack does not make you pick. The velocity planner that
+    # teleop mode needs is constructed lazily, so an operator who never leaves full-body tracking
+    # pays none of its ~1 GB.
+    sonic = SonicModalWholeBodyActionCfg(
         asset_name="robot",
         checkpoint_dir=DEFAULT_CHECKPOINT_DIR,
         joint_names=list(G1_ISAACLab_ORDER),
         action_scale=G1_MODEL_12_ACTION_SCALE,
+    )
+
+    hands = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=list(G1_HAND_JOINT_NAMES),
+        scale=1.0,
+        use_default_offset=False,
+        preserve_order=True,
     )
 
 
@@ -225,7 +232,9 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         # env: they emit a 6-DoF delta plus gripper, which cannot express a whole-body pose.
         from isaaclab_teleop import IsaacTeleopCfg, XrCfg
 
-        from gear_sonic.lab_teleop.retargeters import build_sonic_fullbody_pipeline
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_full_pipeline_builder,
+        )
 
         # Pin the operator's XR frame to the robot's *start* pose; do not let it ride the pelvis.
         #
@@ -265,7 +274,7 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
         # non-identity spawn rotation would need composing in here.
 
         self.isaac_teleop = IsaacTeleopCfg(
-            pipeline_builder=build_sonic_fullbody_pipeline,
+            pipeline_builder=make_sonic_full_pipeline_builder(),
             sim_device=self.sim.device,
             xr_cfg=self.xr,
         )
@@ -286,11 +295,11 @@ class SonicTeleopG1ReplayEnvCfg(SonicTeleopG1EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        from gear_sonic.lab_teleop.retargeters import (
-            build_sonic_fullbody_replay_pipeline,
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_full_pipeline_builder,
         )
 
-        self.isaac_teleop.pipeline_builder = build_sonic_fullbody_replay_pipeline
+        self.isaac_teleop.pipeline_builder = make_sonic_full_pipeline_builder(vendor=None)
 
 
 @configclass
@@ -340,105 +349,11 @@ class SonicTeleopG1LowLatencyReplayEnvCfg(SonicTeleopG1LowLatencyEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        from gear_sonic.lab_teleop.retargeters import (
-            build_sonic_fullbody_replay_pipeline,
-        )
-
-        self.isaac_teleop.pipeline_builder = build_sonic_fullbody_replay_pipeline
-
-
-@configclass
-class SonicHandsActionsCfg(SonicActionsCfg):
-    """SONIC body plus controller-driven hands.
-
-    Term order fixes the action layout, because ``ActionManager`` concatenates terms in
-    declaration order: ``[sonic_reference(83) | hands(14)]`` == 97. The pipeline's
-    ``TensorReorderer`` emits the same order.
-    """
-
-    hands = JointPositionActionCfg(
-        asset_name="robot",
-        joint_names=list(G1_HAND_JOINT_NAMES),
-        scale=1.0,
-        use_default_offset=False,
-        preserve_order=True,
-    )
-
-
-@configclass
-class SonicTeleopG1HandsEnvCfg(SonicTeleopG1EnvCfg):
-    """SONIC whole-body teleoperation with tri-hand controller grasping.
-
-    Adds a second action term for the 14 finger joints, driven from the motion controllers:
-    **trigger** closes index and thumb (pinch), **squeeze** closes middle and thumb (grasp).
-
-    The finger joints ship welded in ``main.urdf`` and are un-welded in this repo, so the
-    articulation is 43 DoF. SONIC still drives exactly its own 29 -- see
-    :class:`SonicActionsCfg` -- and the hands are an independent term, mirroring how
-    ``locomanip_pick_place`` separates body and hand control.
-
-    Action layout is ``[sonic_reference(83) | left_hand(7) | right_hand(7)]`` == 97.
-    """
-
-    actions: SonicHandsActionsCfg = SonicHandsActionsCfg()
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
         from gear_sonic.lab_teleop.retargeters.pipeline import (
-            make_sonic_hands_pipeline_builder,
+            make_sonic_full_pipeline_builder,
         )
 
-        self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder()
-
-
-@configclass
-class SonicTeleopG1HandsReplayEnvCfg(SonicTeleopG1HandsEnvCfg):
-    """Hands variant wired for MCAP replay.
-
-    A capture recorded with controller channels replays its trigger/squeeze values here. Note the
-    existing full-body captures do carry ``controllers/*`` channels, which nothing consumed before
-    this pipeline existed.
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        from gear_sonic.lab_teleop.retargeters.pipeline import (
-            make_sonic_hands_pipeline_builder,
-        )
-
-        self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder(vendor=None)
-
-
-@configclass
-class SonicTeleopG1HandsLowLatencyEnvCfg(SonicTeleopG1HandsEnvCfg):
-    """Hands variant running the **low-latency** SONIC checkpoint.
-
-    Hand control is independent of the SONIC checkpoint: fingers are driven from the motion
-    controllers through their own action term, while SONIC drives the 29 body joints. Swapping the
-    checkpoint therefore only changes the body controller -- the 4-frame reference window and
-    body-frame anchor orientation are picked up automatically from the encoder graph (see
-    :class:`~gear_sonic.lab_teleop.mdp.sonic_policy.SonicVariant`).
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.actions.sonic.checkpoint_dir = LOW_LATENCY_CHECKPOINT_DIR
-
-
-@configclass
-class SonicTeleopG1HandsLowLatencyReplayEnvCfg(SonicTeleopG1HandsLowLatencyEnvCfg):
-    """Low-latency hands variant wired for MCAP replay."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        from gear_sonic.lab_teleop.retargeters.pipeline import (
-            make_sonic_hands_pipeline_builder,
-        )
-
-        self.isaac_teleop.pipeline_builder = make_sonic_hands_pipeline_builder(vendor=None)
+        self.isaac_teleop.pipeline_builder = make_sonic_full_pipeline_builder(vendor=None)
 
 
 @configclass
@@ -451,71 +366,6 @@ class SonicModalActionsCfg:
         joint_names=list(G1_ISAACLab_ORDER),
         action_scale=G1_MODEL_12_ACTION_SCALE,
     )
-
-
-@configclass
-class SonicTeleopG1ModalEnvCfg(SonicTeleopG1EnvCfg):
-    """SONIC teleoperation with operator-switchable encoder mode.
-
-    The left controller's primary click toggles between SONIC's ``smpl`` mode (full-body tracking,
-    the default) and ``teleop`` mode (walk with the thumbsticks), mirroring the real robot's
-    teleop stack. Action layout is ``[sonic_reference(83) | mode(1) | command(8)]`` == 92.
-
-    Requires the velocity planner: ``python download_from_hf.py --low-latency``.
-    """
-
-    actions: SonicModalActionsCfg = SonicModalActionsCfg()
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        from gear_sonic.lab_teleop.retargeters.pipeline import (
-            make_sonic_modal_pipeline_builder,
-        )
-
-        self.isaac_teleop.pipeline_builder = make_sonic_modal_pipeline_builder()
-
-
-@configclass
-class SonicTeleopG1ModalReplayEnvCfg(SonicTeleopG1ModalEnvCfg):
-    """Mode-switching variant wired for MCAP replay."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        from gear_sonic.lab_teleop.retargeters.pipeline import (
-            make_sonic_modal_pipeline_builder,
-        )
-
-        self.isaac_teleop.pipeline_builder = make_sonic_modal_pipeline_builder(vendor=None)
-
-
-@configclass
-class SonicTeleopG1ModalLowLatencyEnvCfg(SonicTeleopG1ModalEnvCfg):
-    """Mode-switching variant running the **low-latency** SONIC checkpoint.
-
-    Mode switching is checkpoint-independent: the mode id and one-hot occupy the same encoder
-    slots in both checkpoints, and the low-latency variant's shorter reference window is picked up
-    automatically from the encoder graph.
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.actions.sonic.checkpoint_dir = LOW_LATENCY_CHECKPOINT_DIR
-
-
-@configclass
-class SonicTeleopG1ModalLowLatencyReplayEnvCfg(SonicTeleopG1ModalLowLatencyEnvCfg):
-    """Low-latency mode-switching variant wired for MCAP replay."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        from gear_sonic.lab_teleop.retargeters.pipeline import (
-            make_sonic_modal_pipeline_builder,
-        )
-
-        self.isaac_teleop.pipeline_builder = make_sonic_modal_pipeline_builder(vendor=None)
 
 
 def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:
