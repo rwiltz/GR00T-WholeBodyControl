@@ -44,6 +44,7 @@ import torch
 from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyAction, SonicWholeBodyActionCfg
 from gear_sonic.lab_teleop.mdp.sonic_planner import (
     PLANNER_CLIP_WALK,
+    PLANNER_CONTEXT_FRAMES,
     PLANNER_QPOS_DIM,
     SONIC_PLANNER_COMMAND_DIM,
     SonicVelocityPlanner,
@@ -158,6 +159,16 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         )
         self._prev_lower_pos: np.ndarray | None = None
         self._qpos_scratch = np.zeros(PLANNER_QPOS_DIM, dtype=np.float32)
+        #: Rolling measured-pose history feeding the planner's context.
+        #:
+        #: Owned here rather than inside the planner so it stays current in **every** mode. The
+        #: planner is built lazily on first entry to teleop mode, so a history kept inside it
+        #: would only advance while walking: re-entering teleop after an interval of full-body
+        #: tracking would then condition the first plan on wherever the robot was when the
+        #: operator last walked, and being autoregressive, that error would propagate through the
+        #: whole horizon.
+        self._qpos_history = np.zeros((PLANNER_CONTEXT_FRAMES, PLANNER_QPOS_DIM), dtype=np.float32)
+        self._qpos_seeded = False
         self._mode = ENCODER_MODE_SMPL
 
         from gear_sonic.lab_teleop.assets.g1_sonic import G1_ISAACLAB_TO_MUJOCO_MAPPING
@@ -201,6 +212,8 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._mode = ENCODER_MODE_SMPL
         self._prev_mode = ENCODER_MODE_SMPL
         self._anchor_yaw = None
+        self._qpos_history[:] = 0.0
+        self._qpos_seeded = False
 
     def _ensure_planner(self) -> SonicVelocityPlanner:
         """Construct the velocity planner on first use.
@@ -305,18 +318,25 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._qpos_scratch[7:][self._isaaclab_to_mujoco] = joints
         return self._qpos_scratch
 
+    def _track_robot_pose(self) -> None:
+        """Append the measured pose to the planner context history. Runs every step, every mode."""
+        frame = self._robot_qpos()
+        if not self._qpos_seeded:
+            self._qpos_history[:] = frame
+            self._qpos_seeded = True
+        else:
+            self._qpos_history[:-1] = self._qpos_history[1:]
+            self._qpos_history[-1] = frame
+
     def _advance_planner(self, command: np.ndarray) -> None:
         """Run the planner and push one frame of lower-body pos+vel into the history."""
         planner = self._ensure_planner()
-        qpos = self._robot_qpos()
-        planner.push_state(qpos)
+        planner.set_context(self._qpos_history)
 
         if float(command[0]) <= 1e-4:
             # No operator input: continue from measured motion rather than a stale command, as the
             # reference implementation does. Needs robot state, hence here rather than upstream.
-            movement, facing = SonicVelocityPlanner.idle_directions(
-                planner._context[0]  # noqa: SLF001 - deliberate: the measured history
-            )
+            movement, facing = SonicVelocityPlanner.idle_directions(self._qpos_history)
             command = command.copy()
             command[1:4] = movement
             command[4:7] = facing
@@ -327,15 +347,28 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         lower_pos = planned_joints[: len(LOWER_BODY_JOINTS)]
 
         dt = self._env.step_dt if hasattr(self._env, "step_dt") else 0.02
+        if self._prev_mode != ENCODER_MODE_TELEOP:
+            # Differencing against the last frame of a previous excursion would manufacture a huge
+            # spurious velocity across the gap.
+            self._prev_lower_pos = None
         if self._prev_lower_pos is None:
             lower_vel = np.zeros_like(lower_pos)
         else:
             lower_vel = (lower_pos - self._prev_lower_pos) / max(dt, 1e-6)
         self._prev_lower_pos = lower_pos.copy()
 
-        self._lower_history[:-1] = self._lower_history[1:]
-        self._lower_history[-1, : len(LOWER_BODY_JOINTS)] = lower_pos
-        self._lower_history[-1, len(LOWER_BODY_JOINTS) :] = lower_vel
+        if self._prev_mode != ENCODER_MODE_TELEOP:
+            # Entering teleop: backfill the whole window with this frame rather than continuing a
+            # window whose older frames come from a previous walk, possibly minutes ago. Mixing
+            # them would hand the encoder a reference trajectory that jumps discontinuously
+            # between two unrelated excursions. Same priming semantics as the proprioception
+            # history uses after a reset.
+            self._lower_history[:, : len(LOWER_BODY_JOINTS)] = lower_pos
+            self._lower_history[:, len(LOWER_BODY_JOINTS) :] = lower_vel
+        else:
+            self._lower_history[:-1] = self._lower_history[1:]
+            self._lower_history[-1, : len(LOWER_BODY_JOINTS)] = lower_pos
+            self._lower_history[-1, len(LOWER_BODY_JOINTS) :] = lower_vel
 
     def _write_mode_slots(self, mode: int) -> None:
         """Write the encoder's mode id and one-hot, which are per-step under mode switching."""
@@ -410,6 +443,8 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         command = actions[0, SONIC_REFERENCE_DIM + 1 :].detach().float().cpu().numpy()
         self._mode = mode if mode in (ENCODER_MODE_TELEOP, ENCODER_MODE_SMPL) else ENCODER_MODE_SMPL
 
+        # Tracked in every mode so a return to teleop plans from where the robot actually is.
+        self._track_robot_pose()
         self._update_anchor(self._mode)
         if self._mode == ENCODER_MODE_TELEOP:
             command = self._to_world_directions(command)

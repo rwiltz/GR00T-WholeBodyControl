@@ -150,6 +150,22 @@ class SonicVelocityPlanner:
         self._cursor = 0
         self._seeded = False
 
+    def set_context(self, history: np.ndarray) -> None:
+        """Replace the whole context window with a caller-owned history.
+
+        Preferred over :meth:`push_state` when the caller already tracks the robot's recent poses,
+        because it decouples *keeping the history current* from *owning the planner*. The action
+        term uses this so it can maintain the history on every control step while still building
+        the planner lazily on first use.
+
+        Args:
+            history: ``(PLANNER_CONTEXT_FRAMES, 36)`` recent measured poses, oldest first.
+        """
+        self._context[0, :] = np.asarray(history, dtype=np.float32).reshape(
+            PLANNER_CONTEXT_FRAMES, PLANNER_QPOS_DIM
+        )
+        self._seeded = True
+
     def push_state(self, qpos: np.ndarray) -> None:
         """Append one measured robot pose to the planner's context.
 
