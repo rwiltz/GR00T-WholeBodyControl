@@ -155,12 +155,25 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             / "V2"
             / "planner_sonic.onnx"
         )
-        # Constructed lazily on first entry to teleop mode. The planner's onnxruntime session
-        # costs ~1 GB of GPU memory, and an operator who never leaves full-body tracking should
-        # not pay for it -- which is what lets mode switching live in every environment rather
-        # than in a separate variant.
+        # Built here, not on first entry to teleop mode. Deferring it put a 1.7 s stall in the
+        # control loop at the moment the operator switches -- 1.25 s to create the onnxruntime
+        # session and 0.49 s for the first graph run, together ~87 control steps at 50 Hz. It
+        # costs ~1 GB of GPU memory that an operator who never leaves tracking mode does not use,
+        # which is the price of not stalling the one who does.
+        #
+        # The graph is a download rather than a repo artefact, so a missing file must not take
+        # down environments that would never have entered teleop mode. In that one case the error
+        # is still deferred to first use, where it can name the mode that needed it.
         self._planner_checkpoint = checkpoint
         self._planner: SonicVelocityPlanner | None = None
+        try:
+            self._planner = self._build_planner()
+        except FileNotFoundError:
+            print(
+                "[SONIC] velocity planner not found; walking mode will fail if selected. "
+                f"Expected at {checkpoint}",
+                flush=True,
+            )
         self._planner_clip = int(cfg.planner_clip)
 
         lower_ids, _ = self._asset.find_joints(list(LOWER_BODY_JOINTS), preserve_order=True)
@@ -242,20 +255,22 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._qpos_seeded = False
         self._ground_visible = None
 
+    def _build_planner(self) -> SonicVelocityPlanner:
+        """Create the velocity planner, warmed up and ready to run inside the control loop."""
+        return SonicVelocityPlanner(
+            checkpoint_path=self._planner_checkpoint,
+            device=self._policy_device,
+            replan_interval=self.cfg.planner_replan_interval,
+        )
+
     def _ensure_planner(self) -> SonicVelocityPlanner:
-        """Construct the velocity planner on first use.
+        """Return the planner, building it now only if construction found no graph to load.
 
         Raises:
-            FileNotFoundError: If the planner graph is absent. Raised here rather than at env
-                construction so environments that never enter teleop mode do not require it.
+            FileNotFoundError: If the planner graph is still absent, naming the download.
         """
         if self._planner is None:
-            print("[SONIC] building the velocity planner (first entry to teleop mode)", flush=True)
-            self._planner = SonicVelocityPlanner(
-                checkpoint_path=self._planner_checkpoint,
-                device=self._policy_device,
-                replan_interval=self.cfg.planner_replan_interval,
-            )
+            self._planner = self._build_planner()
         return self._planner
 
     @staticmethod

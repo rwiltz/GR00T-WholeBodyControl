@@ -53,7 +53,6 @@ Watch the console; it prints only on change:
 
 ```
 [SONIC] mode smpl -> teleop
-[SONIC] building the velocity planner (first entry to teleop mode)
 [SONIC] ground plane shown
 [SONIC] reset: XR anchor restored to (0.0, 0.0, -0.19)
 ```
@@ -66,8 +65,13 @@ pipeline — a different problem from the mode behaving badly.
 **Your viewpoint jumps when you enter walking mode.** It snaps to the robot, and how far it jumps
 depends on how far you have drifted apart. Leaving walking mode freezes it where it is.
 
-**A hitch about once a second while walking** is the planner re-planning. It costs ~50 ms in a
-single control step.
+**A hitch about once a second while walking** is the planner re-planning. It costs ~10 ms in a
+single control step, inside the 20 ms budget.
+
+**Startup takes about two seconds longer than it used to.** The motion planner is now built and
+warmed up before the first frame. It used to be built the first time you pressed into walking
+mode, which stalled the control loop for ~1.7 s -- 87 steps -- at exactly the moment the robot
+started walking.
 
 **Sliding yourself around is smooth VR locomotion** and makes some people queasy. The speed is
 `anchor_pan_speed` on the action config, 1.0 m/s by default; set it to `0.0` to disable.

@@ -96,6 +96,10 @@ class SonicVelocityPlanner:
         replan_interval: Frames to consume before re-planning. ``0`` consumes the whole valid
             plan, which is ``num_pred_frames`` long -- not necessarily the full 64.
         allowed_tokens: Clip token mask; see :data:`PLANNER_WALK_TOKENS`.
+        warmup: Run one throwaway inference during construction. The first call into a fresh
+            onnxruntime session pays lazy kernel and CUDA-graph setup -- measured at ~490 ms
+            against a 20 ms control period -- so paying it here keeps that cost out of the
+            control loop.
 
     Raises:
         FileNotFoundError: If the planner graph is absent.
@@ -107,6 +111,7 @@ class SonicVelocityPlanner:
         device: torch.device | str = "cuda:0",
         replan_interval: int = 0,
         allowed_tokens: tuple[int, ...] = PLANNER_WALK_TOKENS,
+        warmup: bool = True,
     ) -> None:
         import onnxruntime as ort
 
@@ -133,6 +138,20 @@ class SonicVelocityPlanner:
         self._plan: np.ndarray | None = None
         self._cursor = 0
         self._seeded = False
+
+        if warmup:
+            self._warmup()
+
+    def _warmup(self) -> None:
+        """Run the graph once on a neutral standing pose, then discard everything it produced.
+
+        Leaves no state behind: :meth:`reset` clears the plan, the cursor and the seeded flag, so
+        the first real call still plans from the caller's own context rather than from this.
+        """
+        self._context[0, :, 2] = 0.76  # hip height
+        self._context[0, :, 3] = 1.0  # wxyz identity root quaternion
+        self._run(np.array([0.0, 1, 0, 0, 1, 0, 0, 0.76], dtype=np.float32), PLANNER_CLIP_WALK)
+        self.reset()
 
     @property
     def horizon(self) -> int:
