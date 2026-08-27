@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     ok = (
         bool(np.isfinite(refs).all())
         and float(np.abs(quat_norm - 1).max()) < 1e-3
-        and float(root_offset.max()) < 1e-3
+        and hip_axis_spread < 0.5
         and 0.5 < float(extent.mean()) < 3.0
     )
     print("\nRESULT:", "PASS" if ok else "FAIL")
