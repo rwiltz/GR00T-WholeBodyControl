@@ -45,6 +45,7 @@ from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyAction, SonicWholeBo
 from gear_sonic.lab_teleop.mdp.sonic_planner import (
     PLANNER_CLIP_WALK,
     PLANNER_CONTEXT_FRAMES,
+    PLANNER_IDLE_COMMAND,
     PLANNER_LOOKAHEAD_S,
     PLANNER_PERIODIC_REPLAN_S,
     PLANNER_QPOS_DIM,
@@ -541,7 +542,11 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._motion = planner.initialize_from_robot(joints_mujoco)
         self._plan_time = 0.0
         self._since_replan = 0.0
-        self._last_command = None
+        # Record the command the idle plan was generated from, so the very next control step does
+        # not immediately replan it away. Leaving this None made `_replan_needed` fire at once and
+        # the idle trajectory was replaced before it played a single frame -- the initialization
+        # was real but invisible.
+        self._last_command = PLANNER_IDLE_COMMAND.copy()
         if self.cfg.debug_transitions:
             self._log_transition()
 

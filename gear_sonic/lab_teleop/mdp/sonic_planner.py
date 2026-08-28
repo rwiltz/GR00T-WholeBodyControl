@@ -55,6 +55,7 @@ __all__ = [
     "PLANNER_CONTEXT_FRAMES",
     "PLANNER_QPOS_DIM",
     "PLANNER_DEFAULT_HEIGHT",
+    "PLANNER_IDLE_COMMAND",
     "PLANNER_LOOKAHEAD_S",
     "PLANNER_NATIVE_DT",
     "PLANNER_NATIVE_HZ",
@@ -105,6 +106,11 @@ PLANNER_PERIODIC_REPLAN_S = 1.0
 #: Standing height the upstream planner canonicalizes its initial context to
 #: (``InitializeContext``: x = y = 0, z = default height, identity quaternion).
 PLANNER_DEFAULT_HEIGHT = 0.78
+
+#: The zero-movement command used to seed the first plan on entry to walking mode. Held as a
+#: constant so the caller can recognise "still idle" and avoid replanning the idle plan away
+#: before it has played a single frame.
+PLANNER_IDLE_COMMAND = np.array([0.0, 1, 0, 0, 1, 0, 0, PLANNER_DEFAULT_HEIGHT], dtype=np.float32)
 
 
 def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -451,8 +457,7 @@ class SonicVelocityPlanner:
         self._context[0, :, 3] = 1.0  # wxyz identity
         self._context[0, :, 7:] = np.asarray(joint_positions, dtype=np.float32).reshape(1, -1)
         self._seeded = True
-        idle = np.array([0.0, 1, 0, 0, 1, 0, 0, PLANNER_DEFAULT_HEIGHT], dtype=np.float32)
-        return self.plan(idle, PLANNER_CLIP_IDLE)
+        return self.plan(PLANNER_IDLE_COMMAND, PLANNER_CLIP_IDLE)
 
     def context_from_motion(self, motion: PlannerMotion, gen_time: float) -> None:
         """Refill the context by sampling the *current plan*, as upstream does.
