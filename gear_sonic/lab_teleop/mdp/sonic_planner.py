@@ -412,7 +412,23 @@ class SonicVelocityPlanner:
         # predictions -- 44 under the walking token mask. Consuming the tail would replay
         # uninitialized frames as if they were motion.
         num_valid = int(np.asarray(outputs[1]).reshape(-1)[0])
-        return PlannerMotion(native[: max(2, min(num_valid, len(native)))])
+        motion = PlannerMotion(native[: max(2, min(num_valid, len(native)))])
+        # TEMP DEBUG - remove
+        commanded_yaw = float(np.arctan2(facing[0, 1], facing[0, 0]))
+        w, x, y, z = (float(v) for v in motion.qpos[-1, 3:7])
+        native_yaw = float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+        print(
+            f"[DEBUG-PLANNER] facing_in=({facing[0, 0]:.3f},{facing[0, 1]:.3f}) "
+            f"commanded_yaw={commanded_yaw:.3f} native_last_frame_yaw={native_yaw:.3f} "
+            f"context_first_frame_yaw={self._context_yaw():.3f} mode={mode}",
+            flush=True,
+        )
+        return motion
+
+    def _context_yaw(self) -> float:  # TEMP DEBUG - remove
+        """Yaw of the canonical context's first frame, for debug comparison only."""
+        w, x, y, z = (float(v) for v in self._context[0, 0, 3:7])
+        return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
     def initialize_from_robot(self, joint_positions: np.ndarray) -> PlannerMotion:
         """Build the first trajectory when the operator enters walking mode.

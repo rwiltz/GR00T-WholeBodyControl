@@ -167,6 +167,10 @@ class SonicPicoLocomotionRetargeter(BaseRetargeter):
         # so pushing the stick right turns the robot clockwise.
         if abs(rx) >= self._deadzone:
             self._yaw += self._yaw_gain * (-rx) * self._dt
+            print(  # TEMP DEBUG - remove
+                f"[DEBUG-TURN] pico: rx={rx:.3f} yaw={self._yaw:.3f}",
+                flush=True,
+            )
         facing_x, facing_y = math.cos(self._yaw), math.sin(self._yaw)
 
         # Movement: deadzone the magnitude, then rescale so it ramps from zero.

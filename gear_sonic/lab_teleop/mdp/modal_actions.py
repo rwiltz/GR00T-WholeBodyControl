@@ -232,6 +232,16 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         #: their own local freedom -- the same relationship Isaac Lab's ``FOLLOW_PRIM`` gives.
         self._entry_operator_pos: np.ndarray | None = None
         self._entry_operator_yaw = 0.0
+        #: Heading-alignment state for the ``teleop`` anchor-orientation observation, mirroring
+        #: ``ComputeApplyDeltaHeading`` (``g1_deploy_onnx_ref.cpp:583-601``) applied to the
+        #: *planner's own motion* rather than the operator's tracked pose -- that source is
+        #: correct only for ``smpl`` mode. ``_teleop_heading_anchor`` is the robot's heading at
+        #: teleop-mode entry (latched once, like the C++ side's ``reinitialize_heading_`` event);
+        #: ``_motion_start_quat`` is the current plan's own first-frame root orientation,
+        #: re-latched every time a fresh trajectory starts (``current_frame_ == 0`` there).
+        self._teleop_heading_anchor = torch.zeros(self.num_envs, 4, device=self.device)
+        self._teleop_heading_anchor[:, 0] = 1.0
+        self._motion_start_quat = self._teleop_heading_anchor.clone()
         self._motion: PlannerMotion | None = None
         self._plan_time = 0.0
         self._since_replan = 0.0
@@ -252,6 +262,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._qpos_history = np.zeros((PLANNER_CONTEXT_FRAMES, PLANNER_QPOS_DIM), dtype=np.float32)
         self._qpos_seeded = False
         self._mode = ENCODER_MODE_SMPL
+        self._debug_forced_yaw = 0.0  # TEMP DEBUG - remove
 
         #: The environment's control period. Prefer Isaac Lab's canonical ``step_dt`` over
         #: recomputing ``sim.dt * decimation`` so there is one authority for it.
@@ -354,6 +365,10 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._operator_quat[:] = (0.0, 0.0, 0.0, 1.0)
         self._entry_operator_pos = None
         self._entry_operator_yaw = 0.0
+        self._debug_forced_yaw = 0.0  # TEMP DEBUG - remove
+        self._teleop_heading_anchor[:, :] = 0.0
+        self._teleop_heading_anchor[:, 0] = 1.0
+        self._motion_start_quat = self._teleop_heading_anchor.clone()
         self._ground_visible = None
 
     def _build_planner(self) -> SonicVelocityPlanner:
@@ -626,8 +641,27 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._plan_time = 0.0
         self._since_replan = 0.0
         self._last_command = None
+        self._latch_motion_start(latch_heading_anchor=True)
         if self.cfg.debug_transitions:
             self._log_transition()
+
+    def _latch_motion_start(self, latch_heading_anchor: bool) -> None:
+        """Re-anchor the ``teleop`` orientation observation to a fresh trajectory.
+
+        Args:
+            latch_heading_anchor: Also re-latch the robot-heading side of the alignment. Only
+                true on teleop-mode entry: mirrors ``reinitialize_heading_``
+                (``g1_deploy_onnx_ref.cpp:559-570``), which fires on an operator-triggered reset,
+                not on every replan.
+        """
+        from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz
+
+        self._motion_start_quat[:] = torch.as_tensor(
+            self._motion.qpos[0, 3:7], device=self.device
+        ).unsqueeze(0)
+        if latch_heading_anchor:
+            base_quat = isaaclab_quat_to_wxyz(self._asset.data.root_quat_w.torch)
+            self._teleop_heading_anchor[:] = base_quat
 
     def _log_transition(self) -> None:
         """Trace the SMPL -> teleop handoff, so a bad transition is measurable rather than felt."""
@@ -704,6 +738,13 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         planner = self._ensure_planner()
         canonical = self._canonical_command(command)
 
+        # TEMP DEBUG - remove: bypass the joystick's facing entirely and force a full rotation
+        # every 2 seconds, to isolate whether ANY commanded facing_direction can turn the robot.
+        self._debug_forced_yaw = (self._debug_forced_yaw + dt * (2.0 * np.pi / 2.0)) % (2.0 * np.pi)
+        canonical = canonical.copy()
+        canonical[4] = float(np.cos(self._debug_forced_yaw))
+        canonical[5] = float(np.sin(self._debug_forced_yaw))
+
         if self._motion is None:
             # Fresh entry into walking mode. Build the idle trajectory and stop there: storing the
             # canonical command means the next step compares like with like and lets that
@@ -725,10 +766,26 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             # (``pico_manager_thread_server.py:1806``); the walk clip at zero throttle is a
             # different motion from standing still.
             clip = self._planner_clip if self._moving else PLANNER_CLIP_IDLE
+            from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz  # TEMP DEBUG - remove
+
+            robot_yaw = self._yaw_of(  # TEMP DEBUG - remove
+                isaaclab_quat_to_wxyz(self._asset.data.root_quat_w.torch)[0]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            )
+            print(  # TEMP DEBUG - remove
+                f"[DEBUG-TURN] replan: clip={clip} facing=({canonical[4]:.3f},{canonical[5]:.3f}) "
+                f"move=({canonical[1]:.3f},{canonical[2]:.3f}) robot_yaw={robot_yaw:.3f} "
+                f"anchor_yaw={self._anchor_yaw}",
+                flush=True,
+            )
             self._motion = planner.plan(canonical, mode=clip)
             self._plan_time = 0.0
             self._since_replan = 0.0
             self._last_command = np.array(canonical, dtype=np.float32)
+            self._latch_motion_start(latch_heading_anchor=False)
         else:
             self._plan_time += dt
             self._since_replan += dt
@@ -794,12 +851,27 @@ The checkpoint's contract is that terms outside the active mode are zero -- the 
 
         self._fill_lower_body()
 
-        # Single-frame anchor orientation, same maths as smpl mode over one frame.
-        root_quat = reference[:, None, SonicReferenceSlice.ROOT_QUAT]
+        # Single-frame anchor orientation. Unlike smpl mode, the reference here is the SONIC
+        # planner's own predicted trajectory (``self._motion``), not the operator's tracked pose:
+        # per ``GatherMotionAnchorOrientationMutiFrame`` (``g1_deploy_onnx_ref.cpp:612-687``), the
+        # "current_motion_" this observation reads from is the planner's plan in teleop mode and
+        # the operator's kinematic retarget in smpl mode -- they are not interchangeable. Feeding
+        # the operator's pose here left the commanded turn (``facing_direction``) unable to reach
+        # this observation at all: the anchor tracked the operator's own body orientation instead.
+        from gear_sonic.isaac_utils.rotations import calc_heading_quat, calc_heading_quat_inv, quat_mul
+
+        motion_root_quat = torch.as_tensor(
+            self._motion.sample_qpos(self._plan_time)[3:7], device=self.device
+        ).unsqueeze(0)
+        teleop_apply_delta_heading = quat_mul(
+            calc_heading_quat(self._teleop_heading_anchor, w_last=False),
+            calc_heading_quat_inv(self._motion_start_quat, w_last=False),
+            w_last=False,
+        )
         anchor = smpl_anchor_orientation(
-            reference_root_quat=root_quat,
+            reference_root_quat=motion_root_quat[:, None, :],
             robot_base_quat=base_quat,
-            apply_delta_heading=self._apply_delta_heading,
+            apply_delta_heading=teleop_apply_delta_heading,
             orientation_mode=variant.orientation_mode,
         )
         obs[:, TELEOP_ANCHOR_ORI] = anchor.reshape(1, -1)
