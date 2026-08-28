@@ -142,3 +142,168 @@ def test_reset_returns_the_heading_to_zero() -> None:
     )
     assert node._yaw == pytest.approx(0.0)  # noqa: SLF001
     assert np.asarray(out[node.OUTPUT_NAME][0])[4:7] == pytest.approx([1.0, 0.0, 0.0])
+
+
+def test_a_commanded_turn_reaches_the_planner_while_standing_still() -> None:
+    """Turning on the spot must replan, and `_last_command` must not alias the action buffer.
+
+    Two separate faults made the right stick do nothing in walking mode. The first substituted the
+    robot's *measured* facing whenever the stick was centred, discarding the command. The second
+    is what this test pins: `_last_command` held a view into `actions`, which is the
+    ActionManager's reused buffer, so it tracked the live command and the change detection could
+    never fire. Storing a copy is the fix, and the aliasing form passes every shape and dtype
+    check while being silently inert.
+    """
+    import numpy as np
+    import torch
+
+    from gear_sonic.lab_teleop.assets.g1_sonic import G1_MODEL_12_ACTION_SCALE
+    from gear_sonic.lab_teleop.mdp.modal_actions import (
+        SONIC_MODAL_ACTION_DIM,
+        SonicModalWholeBodyAction,
+        SonicModalWholeBodyActionCfg,
+    )
+    from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
+        SONIC_REFERENCE_DIM,
+        SonicReferenceSlice,
+    )
+    from gear_sonic.lab_teleop.tests.sonic_action_harness import FakeArticulation, FakeEnv
+
+    asset = FakeArticulation(num_envs=1, device="cpu")
+    env = FakeEnv(asset, num_envs=1, device="cpu")
+    env.step_dt = 0.02
+    term = SonicModalWholeBodyAction(
+        SonicModalWholeBodyActionCfg(
+            asset_name="robot",
+            checkpoint_dir="gear_sonic_deploy/policy/low_latency",
+            joint_names=[".*"],
+            action_scale=G1_MODEL_12_ACTION_SCALE,
+        ),
+        env,
+    )
+    term.reset()
+
+    planner = term._ensure_planner()  # noqa: SLF001
+    real_plan, headings = planner.plan, []
+
+    def recording(command, mode=None):  # noqa: ANN001, ANN202
+        headings.append(float(np.degrees(np.arctan2(command[5], command[4]))))
+        return real_plan(command, mode)
+
+    planner.plan = recording
+
+    reference = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
+    reference[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
+    reference[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
+    reference[SonicReferenceSlice.VALID] = 1.0
+    # One reused action buffer, exactly as the ActionManager supplies.
+    action = torch.zeros(1, SONIC_MODAL_ACTION_DIM)
+    action[0, :SONIC_REFERENCE_DIM] = torch.from_numpy(reference)
+    base = SONIC_REFERENCE_DIM + 1
+
+    def step(facing_deg: float) -> None:
+        action[0, SONIC_REFERENCE_DIM] = 1.0  # teleop
+        action[0, base + 0] = -1.0  # target_vel sentinel
+        action[0, base + 1] = 0.0  # centred stick: no movement
+        theta = np.radians(facing_deg)
+        action[0, base + 4] = np.cos(theta)
+        action[0, base + 5] = np.sin(theta)
+        action[0, base + 7] = -1.0
+        action[0, base + 10] = 0.0  # not moving
+        term.process_actions(action)
+        term.apply_actions()
+
+    step(0.0)  # entry: the idle plan
+    for degrees in (20.0, 45.0, 70.0, 90.0):
+        step(degrees)
+
+    # Each distinct heading reached the planner, in order, despite the stick being centred.
+    assert headings[1:] == pytest.approx([20.0, 45.0, 70.0, 90.0], abs=0.5)
+
+    # And a repeated heading does not replan: the comparison still works in both directions.
+    before = len(headings)
+    step(90.0)
+    step(90.0)
+    assert len(headings) == before
+
+
+@pytest.mark.parametrize("drift", [(0.0, 0.0), (1.5, 0.0), (0.0, 2.0), (-2.5, 1.5)])
+def test_entering_teleop_puts_the_operator_on_the_robot(drift) -> None:  # noqa: ANN001
+    """The anchor is placed so the *operator* lands on the robot, not so the anchor does.
+
+    Those differ by however far room-scale walking carried the operator from the anchor origin,
+    which in tracking mode is the entire point and can be metres. Snapping the anchor itself to
+    the robot leaves that offset intact and the operator arrives beside the robot.
+    """
+    import numpy as np
+    import torch
+
+    from gear_sonic.lab_teleop.assets.g1_sonic import G1_MODEL_12_ACTION_SCALE
+    from gear_sonic.lab_teleop.mdp.modal_actions import (
+        SONIC_MODAL_ACTION_DIM,
+        SonicModalWholeBodyAction,
+        SonicModalWholeBodyActionCfg,
+    )
+    from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
+        SONIC_REFERENCE_DIM,
+        SonicReferenceSlice,
+    )
+    from gear_sonic.lab_teleop.tests.sonic_action_harness import FakeArticulation, FakeEnv
+
+    class _Xr:
+        anchor_pos = (0.0, 0.0, -0.19)
+        anchor_rot = (0.0, 0.0, 0.0, 1.0)
+
+    class _TeleopCfg:
+        xr_cfg = _Xr()
+
+    asset = FakeArticulation(num_envs=1, device="cpu")
+    env = FakeEnv(asset, num_envs=1, device="cpu")
+    env.step_dt = 0.02
+    env.cfg.isaac_teleop = _TeleopCfg()
+    term = SonicModalWholeBodyAction(
+        SonicModalWholeBodyActionCfg(
+            asset_name="robot",
+            checkpoint_dir="gear_sonic_deploy/policy/low_latency",
+            joint_names=[".*"],
+            action_scale=G1_MODEL_12_ACTION_SCALE,
+        ),
+        env,
+    )
+    term.reset()
+
+    robot_xy = (3.0, -1.0)
+    asset.data.root_pos_w.torch[0, 0] = robot_xy[0]
+    asset.data.root_pos_w.torch[0, 1] = robot_xy[1]
+
+    reference = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
+    reference[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
+    reference[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
+    reference[SonicReferenceSlice.VALID] = 1.0
+    reference[SonicReferenceSlice.OPERATOR_ROOT_POS] = [drift[0], drift[1], 0.0]
+
+    action = torch.zeros(1, SONIC_MODAL_ACTION_DIM)
+    action[0, :SONIC_REFERENCE_DIM] = torch.from_numpy(reference)
+    base = SONIC_REFERENCE_DIM + 1
+    action[0, base + 0] = -1.0
+    action[0, base + 4] = 1.0
+    action[0, base + 7] = -1.0
+
+    action[0, SONIC_REFERENCE_DIM] = 2.0  # tracking; operator walks away from the anchor
+    for _ in range(3):
+        term.process_actions(action)
+        term.apply_actions()
+
+    action[0, SONIC_REFERENCE_DIM] = 1.0  # enter walking mode
+    term.process_actions(action)
+    term.apply_actions()
+
+    # Where the operator actually is: anchor + R(anchor_yaw) . tracked pelvis.
+    anchor = term._xr_cfg.anchor_pos  # noqa: SLF001
+    yaw = term._anchor_yaw  # noqa: SLF001
+    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+    operator = (
+        anchor[0] + cos_y * drift[0] - sin_y * drift[1],
+        anchor[1] + sin_y * drift[0] + cos_y * drift[1],
+    )
+    assert operator == pytest.approx(robot_xy, abs=1e-4)

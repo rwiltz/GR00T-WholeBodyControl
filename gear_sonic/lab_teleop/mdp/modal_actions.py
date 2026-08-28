@@ -215,6 +215,9 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         #: stick magnitude, not from ``target_vel`` -- that is the ``-1.0`` "clip default"
         #: sentinel every step and says nothing about intent.
         self._moving = False
+        #: The operator's tracked pelvis in the anchor frame, from the reference. Used to place the
+        #: anchor so the operator -- not the anchor -- ends up on the robot.
+        self._operator_root = np.zeros(3, dtype=np.float32)
         self._motion: PlannerMotion | None = None
         self._plan_time = 0.0
         self._since_replan = 0.0
@@ -333,6 +336,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._turn_command = 0.0
         self._anchor_pan_yaw = 0.0
         self._moving = False
+        self._operator_root[:] = 0.0
         self._ground_visible = None
 
     def _build_planner(self) -> SonicVelocityPlanner:
@@ -425,6 +429,13 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         Height is held at its configured value rather than followed: tracking the robot's z would
         feed the gait's vertical bob into the headset. Yaw is followed alone and smoothed, for the
         same reason Isaac Lab's own ``FOLLOW_PRIM_SMOOTHED`` does both.
+
+        The anchor is placed so the **operator** lands on the robot, not so the anchor does. Those
+        differ by however far room-scale walking has carried the operator from the anchor origin,
+        which in ``smpl`` mode is the whole point and can be metres. Putting the anchor itself on
+        the robot leaves that offset intact, so the operator arrives beside the robot rather than
+        in it. The tracked pelvis reaches us through the reference because only the retargeter sees
+        raw tracker poses.
         """
         if self._xr_cfg is None:
             return
@@ -447,7 +458,17 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             self._anchor_yaw += float(np.clip(alpha, 0.05, 1.0)) * delta
 
         half = 0.5 * self._anchor_yaw
-        self._xr_cfg.anchor_pos = (float(root_pos[0]), float(root_pos[1]), self._anchor_z)
+        # Where the operator currently stands, in world terms: anchor + R(anchor_yaw) . pelvis.
+        # Solving "operator lands on the robot" for the anchor gives the subtraction below.
+        cos_y, sin_y = float(np.cos(self._anchor_yaw)), float(np.sin(self._anchor_yaw))
+        ox, oy = float(self._operator_root[0]), float(self._operator_root[1])
+        offset_x = cos_y * ox - sin_y * oy
+        offset_y = sin_y * ox + cos_y * oy
+        self._xr_cfg.anchor_pos = (
+            float(root_pos[0]) - offset_x,
+            float(root_pos[1]) - offset_y,
+            self._anchor_z,
+        )
         # XrCfg.anchor_rot is XYZW, not WXYZ (xr_anchor_manager.py:110).
         self._xr_cfg.anchor_rot = (0.0, 0.0, float(np.sin(half)), float(np.cos(half)))
 
@@ -589,27 +610,26 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         )
 
     def _canonical_command(self, command: np.ndarray) -> np.ndarray:
-        """The command as the planner will actually receive it.
+        """The command as the planner receives it.
 
-        With the stick centred the operator supplies no direction, and the reference
-        implementation substitutes the robot's own measured velocity and facing rather than
-        holding a stale heading. That substitution has to happen *before* the command is compared
-        against the last one: comparing a raw command against a stored post-processed one never
-        matches, and every step looks like a change.
+        A pass-through. The retargeter already produces exactly what upstream sends: a zero
+        movement vector when the stick is inside the deadzone, and the accumulated heading
+        regardless (``pico_manager_thread_server.py:1800-1830``).
+
+        Nothing is substituted from measured robot state here. Doing so cost the operator the
+        right stick entirely: with the left stick centred, facing was overwritten with the robot's
+        own measured heading every step, so a commanded turn could never survive to reach the
+        planner. Facing is a *command*, and it holds while the operator is standing still --
+        that is how you turn on the spot.
 
         Args:
             command: ``(8,)`` operator command in world frame.
 
         Returns:
-            ``(8,)`` command to plan from, compare against, and store.
+            The same command. Kept as a named step so the planner call, the change detection and
+            ``_last_command`` provably share one representation.
         """
-        if self._moving:
-            return command
-        movement, facing = SonicVelocityPlanner.idle_directions(self._qpos_history)
-        canonical = command.copy()
-        canonical[1:4] = movement
-        canonical[4:7] = facing
-        return canonical
+        return command
 
     def _replan_needed(self, command: np.ndarray) -> bool:
         """Whether this control step should generate a new trajectory.
@@ -648,7 +668,10 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             # canonical command means the next step compares like with like and lets that
             # trajectory actually play, instead of replanning it away before it delivers a frame.
             self._enter_teleop()
-            self._last_command = canonical
+            # Copy, never alias. ``actions`` is the ActionManager's reused buffer, so storing a
+            # view means `_last_command` silently tracks the live command and the change
+            # detection below can never fire -- the operator's turn reaches nothing.
+            self._last_command = np.array(canonical, dtype=np.float32)
             self._since_replan = 0.0
             return
 
@@ -664,7 +687,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             self._motion = planner.plan(canonical, mode=clip)
             self._plan_time = 0.0
             self._since_replan = 0.0
-            self._last_command = canonical
+            self._last_command = np.array(canonical, dtype=np.float32)
         else:
             self._plan_time += dt
             self._since_replan += dt
@@ -770,6 +793,9 @@ The checkpoint's contract is that terms outside the active mode are zero -- the 
         ground_visible = bool(tail[SONIC_PLANNER_COMMAND_DIM] > 0.5)
         self._turn_command = float(tail[SONIC_PLANNER_COMMAND_DIM + 1])
         self._moving = bool(tail[SONIC_PLANNER_COMMAND_DIM + 2] > 0.5)
+        self._operator_root[:] = (
+            reference[0, SonicReferenceSlice.OPERATOR_ROOT_POS].detach().float().cpu().numpy()
+        )
         self._mode = mode if mode in (ENCODER_MODE_TELEOP, ENCODER_MODE_SMPL) else ENCODER_MODE_SMPL
         if self._mode != self._prev_mode:
             print(

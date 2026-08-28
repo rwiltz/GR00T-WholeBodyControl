@@ -33,11 +33,10 @@ the autoregressive rollout. Only the operator's *command* crosses the boundary f
 
 Frame conventions
 -----------------
-``movement_direction`` and ``facing_direction`` are **absolute world-frame** XY unit vectors with
-``z = 0``, not robot-relative and not integrated turn rates (``controllers.py:196-207``). When the
-operator gives no input the reference implementation falls back to the robot's own measured
-velocity and root yaw rather than holding the last command, which is what
-:meth:`SonicVelocityPlanner.idle_directions` reproduces.
+``movement_direction`` carries the throttle in its magnitude and ``facing_direction`` is a
+world-frame XY unit vector. Both come from the operator and are passed through untouched: a
+centred stick sends zero movement and the heading still holds, which is how the operator turns on
+the spot (``pico_manager_thread_server.py:1800-1830``).
 """
 
 from __future__ import annotations
@@ -365,31 +364,6 @@ class SonicVelocityPlanner:
         else:
             self._context[0, :-1] = self._context[0, 1:]
             self._context[0, -1] = frame
-
-    @staticmethod
-    def idle_directions(qpos_history: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Directions to use when the operator is giving no input.
-
-        Reproduces ``controllers.py:209-218``: continue along the robot's own measured velocity and
-        facing rather than holding the last command, so an idle operator does not command a stale
-        heading.
-
-        Args:
-            qpos_history: ``(frames, 36)`` recent measured poses.
-
-        Returns:
-            ``(movement_direction, facing_direction)``, each a world-frame XY unit vector.
-        """
-        from scipy.spatial.transform import Rotation
-
-        deltas = np.diff(qpos_history[:, :3], axis=0)
-        velocity = deltas.mean(axis=0) * np.array([1.0, 1.0, 0.0]) if len(deltas) else np.zeros(3)
-        movement = velocity / (np.linalg.norm(velocity) + 1e-5)
-        facing = Rotation.from_quat(qpos_history[-1, 3:7], scalar_first=True).apply(
-            np.array([1.0, 0.0, 0.0])
-        ) * np.array([1.0, 1.0, 0.0])
-        facing = facing / (np.linalg.norm(facing) + 1e-5)
-        return movement.astype(np.float32), facing.astype(np.float32)
 
     def plan(self, command: np.ndarray, mode: int = PLANNER_CLIP_WALK) -> PlannerMotion:
         """Run the graph once and return the whole planned trajectory.

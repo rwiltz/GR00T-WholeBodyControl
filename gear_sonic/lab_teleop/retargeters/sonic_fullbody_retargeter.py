@@ -21,7 +21,7 @@ Upstream references (``gear_sonic/scripts/pico_manager_thread_server.py``):
 
 Output layout
 -------------
-A single flat ``(104,)`` float32 vector, so it composes with the standard
+A single flat ``(107,)`` float32 vector, so it composes with the standard
 ``OutputCombiner({"action": ...})`` convention that ``IsaacTeleopDevice.advance()`` expects::
 
     [0]      valid flag (1.0 = body tracking live this frame, 0.0 = holding last good frame)
@@ -30,6 +30,7 @@ A single flat ``(104,)`` float32 vector, so it composes with the standard
     [77:83]  wrist_joint_pos    (6,)    G1 wrist angles, IsaacLab joint indices [23..28]
     [83:92]  vr_3point_pos      (3, 3)  root-relative; left hand, right hand, neck
     [92:104] vr_3point_orn      (3, 4)  wxyz, root-relative; left hand, right hand, neck
+    [104:107] operator_root_pos (3,)    tracked pelvis in the XR anchor frame, robot axes
 
 Consumers must **not** treat this as SONIC's encoder input directly. It is one *reference frame*.
 The downstream ``ActionTerm`` is responsible for (a) stacking a rolling window of these frames,
@@ -166,7 +167,7 @@ _UNITY_TO_ROBOT = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
 
 #: Flat output width: 1 valid flag + 24*3 joints + 4 root quat + 6 wrist angles + 3*3 vr_3point
 #: positions + 3*4 vr_3point orientations.
-SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6 + 3 * 3 + 3 * 4
+SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6 + 3 * 3 + 3 * 4 + 3
 
 
 class SonicReferenceSlice:
@@ -178,6 +179,7 @@ class SonicReferenceSlice:
     WRIST_JOINT_POS = slice(77, 83)
     VR3_POS = slice(83, 92)
     VR3_ORN = slice(92, 104)
+    OPERATOR_ROOT_POS = slice(104, 107)
 
 
 @dataclass
@@ -306,9 +308,10 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         frame[SonicReferenceSlice.SMPL_JOINTS] = smpl_joints_local
         frame[SonicReferenceSlice.ROOT_QUAT] = root_quat
         frame[SonicReferenceSlice.WRIST_JOINT_POS] = wrist_joint_pos
-        vr3_pos, vr3_orn = self._vr_three_point(body_poses)
+        vr3_pos, vr3_orn, operator_root = self._vr_three_point(body_poses)
         frame[SonicReferenceSlice.VR3_POS] = vr3_pos.reshape(-1)
         frame[SonicReferenceSlice.VR3_ORN] = vr3_orn.reshape(-1)
+        frame[SonicReferenceSlice.OPERATOR_ROOT_POS] = operator_root
         return frame
 
     @staticmethod
@@ -339,8 +342,10 @@ class SonicFullBodyRetargeter(BaseRetargeter):
             body_poses: ``(24, 7)`` ``[x, y, z, qx, qy, qz, qw]`` per XR body joint, Unity frame.
 
         Returns:
-            ``(positions (3, 3), orientations (3, 4) wxyz)`` for left hand, right hand and neck,
-            each relative to the root.
+            ``(positions (3, 3), orientations (3, 4) wxyz, root_pos (3,))``. The three points are
+            relative to the root; ``root_pos`` is the operator's tracked pelvis in the anchor
+            frame, which the caller needs to place the anchor so the *operator* lands on the robot
+            rather than the anchor doing so.
         """
         q = _UNITY_TO_ROBOT
         ids = VR3_KEYPOINT_SMPL_IDS
@@ -362,7 +367,7 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         for i in range(1, 4):
             out_pos[i - 1] = root_inv.apply(positions[i] - root_pos)
             out_rot[i - 1] = (root_inv * rotations[i]).as_quat(scalar_first=True)
-        return out_pos, out_rot
+        return out_pos, out_rot, np.asarray(root_pos, dtype=np.float32)
 
     def _xr_to_smpl_local(self, body_poses: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """XR global quaternions -> SMPL local axis-angle.

@@ -108,7 +108,7 @@ def test_matches_upstream(retargeter: SonicFullBodyRetargeter, seed: int) -> Non
 def test_output_layout(retargeter: SonicFullBodyRetargeter) -> None:
     """The flat frame is the advertised width and flags itself valid."""
     frame = retargeter._retarget(_make_body_frame(1))  # noqa: SLF001
-    assert frame.shape == (SONIC_REFERENCE_DIM,) == (104,)
+    assert frame.shape == (SONIC_REFERENCE_DIM,) == (107,)
     assert frame.dtype == np.float32
     assert frame[SonicReferenceSlice.VALID] == pytest.approx(1.0)
 
@@ -166,7 +166,7 @@ def test_vr_three_point_matches_the_shipped_pico_implementation() -> None:
     for seed in (1, 5, 11):
         body_poses = _make_body_frame(seed)
         expected = upstream._process_3pt_pose(body_poses.copy())  # (3, 7) [xyz, wxyz]
-        positions, orientations = retargeter._vr_three_point(body_poses)  # noqa: SLF001
+        positions, orientations, _root = retargeter._vr_three_point(body_poses)  # noqa: SLF001
 
         np.testing.assert_allclose(positions, expected[:, :3], atol=1e-5)
         for i in range(3):
@@ -192,8 +192,8 @@ def test_vr_three_point_uses_tracked_positions_not_canonical_fk() -> None:
     scaled = body_poses.copy()
     scaled[:, :3] *= 1.5  # a taller operator, same posture
 
-    base, _ = retargeter._vr_three_point(body_poses)  # noqa: SLF001
-    grown, _ = retargeter._vr_three_point(scaled)  # noqa: SLF001
+    base, _, _ = retargeter._vr_three_point(body_poses)  # noqa: SLF001
+    grown, _, _ = retargeter._vr_three_point(scaled)  # noqa: SLF001
     assert np.linalg.norm(grown - base) > 0.05
 
     # The smpl joint block, by contrast, is unchanged: proportions are replaced by the canonical
