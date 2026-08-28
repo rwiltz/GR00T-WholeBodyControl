@@ -89,3 +89,28 @@ def test_healthy_install_binds_the_cuda_provider() -> None:
 
     policy = SonicOnnxPolicy(CHECKPOINT, device="cuda:0")
     assert policy._gpu_resident is True  # noqa: SLF001
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_latent_is_authoritative_on_every_backend(device: str) -> None:
+    """``encode`` must leave the token in :attr:`latent`, whichever provider ran it.
+
+    The GPU path returns the bound buffer because onnxruntime wrote straight into it. The CPU path
+    used to return a fresh tensor and leave ``latent`` at zero, so anything reading the token after
+    the fact -- a dataset recorder, say -- would silently capture zeros on that backend while
+    looking perfectly healthy.
+    """
+    if device.startswith("cuda"):
+        _requires_cuda()
+    from gear_sonic.lab_teleop.mdp.sonic_policy import SonicOnnxPolicy
+
+    policy = SonicOnnxPolicy(CHECKPOINT, device=device)
+    obs = torch.randn(1, policy.variant.encoder_input_dim, device=policy.device) * 0.1
+
+    token = policy.encode(obs)
+    assert token.data_ptr() == policy.latent.data_ptr(), "encode must return the persistent buffer"
+    assert float(policy.latent.abs().sum()) > 0.0, "latent left at zero after encode"
+
+    # A second encode of the same input reproduces it: the buffer is being written, not appended.
+    again = policy.encode(obs)
+    assert torch.allclose(token, again, atol=1e-6)

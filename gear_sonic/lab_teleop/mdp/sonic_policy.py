@@ -330,7 +330,7 @@ class SonicOnnxPolicy:
     """Runs the SONIC encoder and decoder ONNX graphs, GPU-resident where possible.
 
     On CUDA, inference is zero-copy: the caller writes into :attr:`encoder_obs`, and results land
-    in :attr:`latent` and :attr:`action`, all of which are persistent torch CUDA tensors bound to
+    in :attr:`latent` and :attr:`action`, all of which are persistent torch tensors bound to
     onnxruntime once at construction. On CPU the runner falls back to the numpy path, which is
     correct but slow enough that teleoperation will not hold 50 Hz.
 
@@ -592,8 +592,8 @@ class SonicOnnxPolicy:
                 :attr:`encoder_obs` itself the copy is skipped and the call is fully zero-copy.
 
         Returns:
-            ``(1, 64)`` motion token. On CUDA this is :attr:`latent`, a persistent buffer that is
-            overwritten by the next call -- clone it if you need to retain it.
+            ``(1, 64)`` motion token. This is :attr:`latent` on every backend -- a persistent
+            buffer overwritten by the next call, so clone it if you need to retain it.
         """
         if encoder_obs.shape[-1] != self.variant.encoder_input_dim:
             raise ValueError(
@@ -604,7 +604,11 @@ class SonicOnnxPolicy:
         if not self._gpu_resident:
             arr = encoder_obs.detach().cpu().numpy().astype(np.float32)
             token = self._encoder.run(None, {self._encoder_input: arr})[0]
-            return torch.from_numpy(token).to(self.device)
+            # Write through so :attr:`latent` is authoritative on this path too. Returning a fresh
+            # tensor and leaving the buffer at zero would make it a trap for anything that reads
+            # the token after the fact -- a recorder, say -- which would silently capture zeros.
+            self.latent.copy_(torch.from_numpy(token))
+            return self.latent
 
         if encoder_obs.data_ptr() != self.encoder_obs.data_ptr():
             self.encoder_obs.copy_(encoder_obs)
