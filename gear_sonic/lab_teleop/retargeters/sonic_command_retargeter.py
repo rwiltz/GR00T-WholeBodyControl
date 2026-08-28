@@ -13,14 +13,13 @@ into the form ``planner_sonic.onnx`` consumes and adding the operator's mode sel
                           hip_height]                    facing_dir(3), height,
                                                          ground_visible]
 
-Controls: the **left** primary click toggles the encoder mode. A click rather than trigger or
-squeeze because those are already claimed by the tri-hand retargeters, and the left hand because
-the right one drives the session (start/stop and reset).
+Controls: the **left** primary click (X) toggles the encoder mode, and the **left** secondary
+click (Y) toggles ground-plane visibility. The left hand is used for both because the right one
+drives the session (start/stop and reset).
 
-Ground-plane visibility is **derived from the mode**, not toggled separately: the floor is shown in
-``teleop`` mode and hidden in ``smpl`` mode. That makes the floor the operator's mode indicator --
-visible in a headset without looking away from the robot -- and removes a control that only ever
-existed to work around not knowing which mode you were in.
+Ground-plane visibility used to be derived from the mode -- shown in ``teleop``, hidden in
+``smpl`` -- so the floor doubled as a mode indicator. That coupling has been removed: the two are
+now independent latches, so an operator can show or hide the floor in either mode.
 
 Everything here is a pure function of **operator input**, which is why it belongs on the Isaac
 Teleop side of the boundary. The planner it feeds does not: that is closed-loop on the robot's
@@ -87,6 +86,9 @@ __all__ = [
 SONIC_ENCODER_MODE_TELEOP = 1
 SONIC_ENCODER_MODE_SMPL = 2
 
+#: Ground plane is hidden at startup and after reset, same as the old mode-derived default.
+DEFAULT_GROUND_VISIBLE = False
+
 #: ``[mode, target_vel, movement(3), facing(3), height, ground_visible, turn_rate, moving]``.
 #: Slots 1..8 are :class:`SonicPicoLocomotionRetargeter`'s block, passed through untouched.
 SONIC_COMMAND_DIM = 12
@@ -120,6 +122,8 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         self._default_mode = int(default_mode)
         self._mode = int(default_mode)
         self._toggle_was_down = False
+        self._ground_visible = DEFAULT_GROUND_VISIBLE
+        self._ground_toggle_was_down = False
         self._out = np.zeros(SONIC_COMMAND_DIM, dtype=np.float32)
         super().__init__(name=name)
 
@@ -160,10 +164,12 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
     def _compute_fn(
         self, inputs: RetargeterIO, outputs: RetargeterIO, context
     ) -> None:  # noqa: ANN001
-        """Latch the mode toggle and build the locomotion command."""
+        """Latch the mode and ground-plane toggles, and build the locomotion command."""
         if context.execution_events.reset:
             self._mode = self._default_mode
             self._toggle_was_down = False
+            self._ground_visible = DEFAULT_GROUND_VISIBLE
+            self._ground_toggle_was_down = False
 
         controller = inputs[f"controller_{self._toggle_side}"]
         if not controller.is_none:
@@ -177,6 +183,11 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
                 )
             self._toggle_was_down = down
 
+            ground_toggle_down = bool(controller[ControllerInputIndex.SECONDARY_CLICK])
+            if ground_toggle_down and not self._ground_toggle_was_down:
+                self._ground_visible = not self._ground_visible
+            self._ground_toggle_was_down = ground_toggle_down
+
         locomotion = np.asarray(
             np.from_dlpack(inputs[PICO_OUTPUT][0]), dtype=np.float32
         ).reshape(PICO_LOCOMOTION_DIM)
@@ -185,8 +196,8 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         self._out[0] = float(self._mode)
         # target_vel, movement, facing and height, exactly as the PICO loop produced them.
         self._out[1:9] = locomotion[0:8]
-        # The floor is the mode indicator: shown while walking, hidden while tracking.
-        self._out[9] = 1.0 if self._mode == SONIC_ENCODER_MODE_TELEOP else 0.0
+        # Ground plane visibility, latched independently by the squeeze toggle above.
+        self._out[9] = 1.0 if self._ground_visible else 0.0
         # Raw turn, for the action term to swing the XR anchor in smpl mode where there is no
         # planner to face anywhere, and the moving flag it uses to pick the idle clip.
         self._out[10] = locomotion[8]
