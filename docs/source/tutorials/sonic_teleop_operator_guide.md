@@ -34,10 +34,14 @@ The low-latency checkpoint trails you by ~80 ms instead of ~200 ms. Fetch it wit
 | trigger | pinch — index and thumb |
 | squeeze | grasp — middle and thumb |
 | left stick | **tracking mode**: slide yourself across the floor<br>**walking mode**: walk the robot |
-| right stick, up/down | walking mode: raise/lower the robot's hips |
+| right stick, left/right | **tracking mode**: turn yourself<br>**walking mode**: turn the robot |
 
 Everything is on the face buttons because trigger and squeeze drive the hands. The left hand owns
 the robot's mode; the right hand owns the session. No keyboard is needed.
+
+Right stick up/down is unused: hip height went away with the port to the robot's own stick
+semantics, which send "use the clip default" for height. See
+[the control card](sonic_teleop_controls.md) for the one-page version.
 
 **The floor tells you which mode you are in** — visible in walking mode, hidden in tracking mode.
 It is not a separate control.
