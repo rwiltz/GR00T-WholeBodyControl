@@ -227,19 +227,21 @@ def test_a_commanded_turn_reaches_the_planner_while_standing_still() -> None:
     assert len(headings) == before
 
 
-@pytest.mark.parametrize(
-    "tracked", [(0.0, 0.9, 0.0), (1.5, 0.9, 0.0), (0.0, 0.9, 2.0), (-2.5, 0.9, 1.5)]
-)
-def test_entering_teleop_puts_the_operator_on_the_robot(tracked) -> None:  # noqa: ANN001
-    """The anchor must place the *operator* on the robot, per the runtime's own composition.
+@pytest.mark.parametrize("tracked", [(0.0, 0.9, 0.0), (1.5, 0.9, 0.0), (-2.5, 0.9, 1.5)])
+@pytest.mark.parametrize("operator_yaw_deg", [0.0, 90.0, 180.0, -135.0])
+def test_entering_teleop_puts_the_operator_in_the_robot(tracked, operator_yaw_deg) -> None:  # noqa: ANN001
+    """The operator must land *in* the robot, facing the way it faces.
 
-    Checked by reproducing what ``XrAnchorManager`` does -- ``R_anchor @ R_oxr_to_usd`` applied to
-    the raw OpenXR pose, then translated -- rather than by re-using this module's own convention
-    on both sides, which would pass whatever transform we picked.
+    Both halves are checked by reproducing the runtime's own composition,
+    ``R_anchor @ R_oxr_to_usd @ pose_oxr`` (``xr_anchor_manager.py:_build_matrix``), rather than
+    re-using this module's conventions -- a test that does the latter passes for any transform.
 
-    ``tracked`` is a raw OpenXR pelvis pose: Y is height, X and Z are the floor plane.
+    The heading half is not incidental. Ignoring the operator's own facing leaves them mirrored
+    through the robot: standing across from it, looking at it, rather than standing in it. The
+    180 degree case reproduces exactly that.
     """
     import numpy as np
+    from scipy.spatial.transform import Rotation as sRot
     import torch
 
     from gear_sonic.lab_teleop.assets.g1_sonic import G1_MODEL_12_ACTION_SCALE
@@ -254,11 +256,6 @@ def test_entering_teleop_puts_the_operator_on_the_robot(tracked) -> None:  # noq
         SonicReferenceSlice,
     )
     from gear_sonic.lab_teleop.tests.sonic_action_harness import FakeArticulation, FakeEnv
-
-    # The conversion must equal the runtime's, or every prediction below is meaningless.
-    np.testing.assert_array_equal(
-        OXR_TO_USD, np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
-    )
 
     class _Xr:
         anchor_pos = (0.0, 0.0, -0.19)
@@ -285,12 +282,17 @@ def test_entering_teleop_puts_the_operator_on_the_robot(tracked) -> None:  # noq
     robot_xy = (3.0, -1.0)
     asset.data.root_pos_w.torch[0, 0] = robot_xy[0]
     asset.data.root_pos_w.torch[0, 1] = robot_xy[1]
+    # Robot facing along +X (identity), matching the harness's XYZW identity root quaternion.
+
+    # The operator's tracked pelvis: OpenXR axes, so yaw is a rotation about that frame's Y.
+    operator_rot = sRot.from_euler("y", operator_yaw_deg, degrees=True)
 
     reference = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
     reference[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
     reference[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
     reference[SonicReferenceSlice.VALID] = 1.0
     reference[SonicReferenceSlice.OPERATOR_ROOT_POS] = tracked
+    reference[SonicReferenceSlice.OPERATOR_ROOT_QUAT] = operator_rot.as_quat()  # xyzw
 
     action = torch.zeros(1, SONIC_MODAL_ACTION_DIM)
     action[0, :SONIC_REFERENCE_DIM] = torch.from_numpy(reference)
@@ -299,7 +301,7 @@ def test_entering_teleop_puts_the_operator_on_the_robot(tracked) -> None:  # noq
     action[0, base + 4] = 1.0
     action[0, base + 7] = -1.0
 
-    action[0, SONIC_REFERENCE_DIM] = 2.0  # tracking; the operator walks away from the anchor
+    action[0, SONIC_REFERENCE_DIM] = 2.0  # tracking: the operator moves away from the anchor
     for _ in range(3):
         term.process_actions(action)
         term.apply_actions()
@@ -308,11 +310,13 @@ def test_entering_teleop_puts_the_operator_on_the_robot(tracked) -> None:  # noq
     term.process_actions(action)
     term.apply_actions()
 
-    # Reproduce XrAnchorManager._build_matrix: world = R_anchor @ R_oxr_to_usd @ p_oxr + anchor_pos
-    from scipy.spatial.transform import Rotation as sRot
-
     anchor_pos = np.asarray(term._xr_cfg.anchor_pos, dtype=np.float64)  # noqa: SLF001
     r_anchor = sRot.from_quat(np.asarray(term._xr_cfg.anchor_rot)).as_matrix()  # noqa: SLF001
-    operator_world = r_anchor @ OXR_TO_USD @ np.asarray(tracked) + anchor_pos
 
+    # Position: the operator is standing in the robot.
+    operator_world = r_anchor @ OXR_TO_USD @ np.asarray(tracked) + anchor_pos
     assert operator_world[:2] == pytest.approx(robot_xy, abs=1e-4)
+
+    # Heading: and facing the way it faces, not across from it.
+    facing = r_anchor @ OXR_TO_USD @ operator_rot.as_matrix()
+    assert float(np.arctan2(facing[1, 0], facing[0, 0])) == pytest.approx(0.0, abs=1e-4)

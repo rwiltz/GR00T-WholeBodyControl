@@ -21,7 +21,7 @@ Upstream references (``gear_sonic/scripts/pico_manager_thread_server.py``):
 
 Output layout
 -------------
-A single flat ``(107,)`` float32 vector, so it composes with the standard
+A single flat ``(111,)`` float32 vector, so it composes with the standard
 ``OutputCombiner({"action": ...})`` convention that ``IsaacTeleopDevice.advance()`` expects::
 
     [0]      valid flag (1.0 = body tracking live this frame, 0.0 = holding last good frame)
@@ -31,6 +31,7 @@ A single flat ``(107,)`` float32 vector, so it composes with the standard
     [83:92]  vr_3point_pos      (3, 3)  root-relative; left hand, right hand, neck
     [92:104] vr_3point_orn      (3, 4)  wxyz, root-relative; left hand, right hand, neck
     [104:107] operator_root_pos (3,)    tracked pelvis, anchor frame, raw OpenXR axes
+    [107:111] operator_root_quat (4,)   tracked pelvis orientation, xyzw, raw OpenXR axes
 
 Consumers must **not** treat this as SONIC's encoder input directly. It is one *reference frame*.
 The downstream ``ActionTerm`` is responsible for (a) stacking a rolling window of these frames,
@@ -167,7 +168,7 @@ _UNITY_TO_ROBOT = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
 
 #: Flat output width: 1 valid flag + 24*3 joints + 4 root quat + 6 wrist angles + 3*3 vr_3point
 #: positions + 3*4 vr_3point orientations.
-SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6 + 3 * 3 + 3 * 4 + 3
+SONIC_REFERENCE_DIM = 1 + _NUM_BODY_JOINTS * 3 + 4 + 6 + 3 * 3 + 3 * 4 + 3 + 4
 
 
 class SonicReferenceSlice:
@@ -180,6 +181,7 @@ class SonicReferenceSlice:
     VR3_POS = slice(83, 92)
     VR3_ORN = slice(92, 104)
     OPERATOR_ROOT_POS = slice(104, 107)
+    OPERATOR_ROOT_QUAT = slice(107, 111)
 
 
 @dataclass
@@ -285,6 +287,7 @@ class SonicFullBodyRetargeter(BaseRetargeter):
             neutral[SonicReferenceSlice.ROOT_QUAT.start] = 1.0  # wxyz identity
             # Same reasoning for the three vr_3point quaternions: zeros are not a rotation.
             neutral[SonicReferenceSlice.VR3_ORN][0::4] = 1.0  # positions stay zero
+            neutral[SonicReferenceSlice.OPERATOR_ROOT_QUAT][3] = 1.0  # xyzw identity
             return neutral
         held = self._last_good.copy()
         held[SonicReferenceSlice.VALID] = 0.0
@@ -308,10 +311,11 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         frame[SonicReferenceSlice.SMPL_JOINTS] = smpl_joints_local
         frame[SonicReferenceSlice.ROOT_QUAT] = root_quat
         frame[SonicReferenceSlice.WRIST_JOINT_POS] = wrist_joint_pos
-        vr3_pos, vr3_orn, operator_root = self._vr_three_point(body_poses)
+        vr3_pos, vr3_orn, operator_pos, operator_quat = self._vr_three_point(body_poses)
         frame[SonicReferenceSlice.VR3_POS] = vr3_pos.reshape(-1)
         frame[SonicReferenceSlice.VR3_ORN] = vr3_orn.reshape(-1)
-        frame[SonicReferenceSlice.OPERATOR_ROOT_POS] = operator_root
+        frame[SonicReferenceSlice.OPERATOR_ROOT_POS] = operator_pos
+        frame[SonicReferenceSlice.OPERATOR_ROOT_QUAT] = operator_quat
         return frame
 
     @staticmethod
@@ -371,7 +375,12 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         # operator in the world must convert with the runtime's own ``_OXR_TO_USD_ROTATION``, not
         # with ``Q``: both send Y to height, so a mistake there looks like a correct height with
         # the horizontal offset rotated 180 degrees.
-        return out_pos, out_rot, np.asarray(body_poses[ids[0]][:3], dtype=np.float32)
+        return (
+            out_pos,
+            out_rot,
+            np.asarray(body_poses[ids[0]][:3], dtype=np.float32),
+            np.asarray(body_poses[ids[0]][3:7], dtype=np.float32),
+        )
 
     def _xr_to_smpl_local(self, body_poses: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """XR global quaternions -> SMPL local axis-angle.

@@ -226,6 +226,12 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         #: The operator's tracked pelvis in the anchor frame, from the reference. Used to place the
         #: anchor so the operator -- not the anchor -- ends up on the robot.
         self._operator_root = np.zeros(3, dtype=np.float32)
+        self._operator_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # xyzw
+        #: The operator's pose in the anchor frame at the instant walking mode was entered, in USD
+        #: axes. Held constant afterwards so the anchor rides the robot while the operator keeps
+        #: their own local freedom -- the same relationship Isaac Lab's ``FOLLOW_PRIM`` gives.
+        self._entry_operator_pos: np.ndarray | None = None
+        self._entry_operator_yaw = 0.0
         self._motion: PlannerMotion | None = None
         self._plan_time = 0.0
         self._since_replan = 0.0
@@ -345,6 +351,9 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._anchor_pan_yaw = 0.0
         self._moving = False
         self._operator_root[:] = 0.0
+        self._operator_quat[:] = (0.0, 0.0, 0.0, 1.0)
+        self._entry_operator_pos = None
+        self._entry_operator_yaw = 0.0
         self._ground_visible = None
 
     def _build_planner(self) -> SonicVelocityPlanner:
@@ -457,20 +466,31 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         base_quat = isaaclab_quat_to_wxyz(data.root_quat_w.torch)[0].detach().float().cpu().numpy()
         yaw = self._yaw_of(base_quat)
 
-        if self._prev_mode != ENCODER_MODE_TELEOP or self._anchor_yaw is None:
-            self._anchor_yaw = yaw  # snap on entry, no blend from a stale heading
+        if self._prev_mode != ENCODER_MODE_TELEOP or self._entry_operator_pos is None:
+            # Capture where the operator stands and which way they face, once. Holding these
+            # constant afterwards makes the anchor ride the robot while leaving the operator free
+            # to move locally; recomputing them every step would pin them rigidly to the robot and
+            # cancel their own motion.
+            self._entry_operator_pos = OXR_TO_USD @ self._operator_root
+            self._entry_operator_yaw = self._operator_yaw_usd()
+            self._anchor_yaw = None
+
+        # Align the operator's heading with the robot's, not the anchor's. The runtime composes
+        # ``R_anchor @ R_oxr_to_usd @ R_pelvis``, so the anchor has to carry the *difference*:
+        # ignoring the operator's own facing leaves them mirrored, standing across from the robot
+        # looking at it rather than standing in it.
+        target_yaw = yaw - self._entry_operator_yaw
+        if self._anchor_yaw is None:
+            self._anchor_yaw = target_yaw  # snap on entry, no blend from a stale heading
         else:
             dt = self._control_dt
             alpha = 1.0 - float(np.exp(-dt / max(ANCHOR_YAW_SMOOTHING_TIME, 1e-6)))
-            delta = (yaw - self._anchor_yaw + np.pi) % (2.0 * np.pi) - np.pi
+            delta = (target_yaw - self._anchor_yaw + np.pi) % (2.0 * np.pi) - np.pi
             self._anchor_yaw += float(np.clip(alpha, 0.05, 1.0)) * delta
 
         half = 0.5 * self._anchor_yaw
-        # Where the operator currently stands, in world terms: anchor + R(anchor_yaw) . pelvis.
-        # Solving "operator lands on the robot" for the anchor gives the subtraction below.
         cos_y, sin_y = float(np.cos(self._anchor_yaw)), float(np.sin(self._anchor_yaw))
-        operator_usd = OXR_TO_USD @ self._operator_root
-        ox, oy = float(operator_usd[0]), float(operator_usd[1])
+        ox, oy = float(self._entry_operator_pos[0]), float(self._entry_operator_pos[1])
         offset_x = cos_y * ox - sin_y * oy
         offset_y = sin_y * ox + cos_y * oy
         self._xr_cfg.anchor_pos = (
@@ -480,6 +500,18 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         )
         # XrCfg.anchor_rot is XYZW, not WXYZ (xr_anchor_manager.py:110).
         self._xr_cfg.anchor_rot = (0.0, 0.0, float(np.sin(half)), float(np.cos(half)))
+
+    def _operator_yaw_usd(self) -> float:
+        """The operator's heading in USD world axes, before the anchor rotation is applied.
+
+        Their tracked orientation arrives in raw OpenXR axes, so it has to go through the same
+        ``R_oxr_to_usd`` the runtime uses before a yaw can be read off it.
+        """
+        from scipy.spatial.transform import Rotation as sRot
+
+        rot = sRot.from_quat(np.asarray(self._operator_quat, dtype=np.float64)).as_matrix()
+        converted = OXR_TO_USD @ rot
+        return float(np.arctan2(converted[1, 0], converted[0, 0]))
 
     def _pan_anchor(self) -> None:
         """Slide the anchor across the ground plane from the operator's stick, in ``smpl`` mode.
@@ -804,6 +836,9 @@ The checkpoint's contract is that terms outside the active mode are zero -- the 
         self._moving = bool(tail[SONIC_PLANNER_COMMAND_DIM + 2] > 0.5)
         self._operator_root[:] = (
             reference[0, SonicReferenceSlice.OPERATOR_ROOT_POS].detach().float().cpu().numpy()
+        )
+        self._operator_quat[:] = (
+            reference[0, SonicReferenceSlice.OPERATOR_ROOT_QUAT].detach().float().cpu().numpy()
         )
         self._mode = mode if mode in (ENCODER_MODE_TELEOP, ENCODER_MODE_SMPL) else ENCODER_MODE_SMPL
         if self._mode != self._prev_mode:
