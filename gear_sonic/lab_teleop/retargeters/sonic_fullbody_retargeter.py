@@ -30,7 +30,7 @@ A single flat ``(107,)`` float32 vector, so it composes with the standard
     [77:83]  wrist_joint_pos    (6,)    G1 wrist angles, IsaacLab joint indices [23..28]
     [83:92]  vr_3point_pos      (3, 3)  root-relative; left hand, right hand, neck
     [92:104] vr_3point_orn      (3, 4)  wxyz, root-relative; left hand, right hand, neck
-    [104:107] operator_root_pos (3,)    tracked pelvis in the XR anchor frame, robot axes
+    [104:107] operator_root_pos (3,)    tracked pelvis, anchor frame, raw OpenXR axes
 
 Consumers must **not** treat this as SONIC's encoder input directly. It is one *reference frame*.
 The downstream ``ActionTerm`` is responsible for (a) stacking a rolling window of these frames,
@@ -367,7 +367,11 @@ class SonicFullBodyRetargeter(BaseRetargeter):
         for i in range(1, 4):
             out_pos[i - 1] = root_inv.apply(positions[i] - root_pos)
             out_rot[i - 1] = (root_inv * rotations[i]).as_quat(scalar_first=True)
-        return out_pos, out_rot, np.asarray(root_pos, dtype=np.float32)
+        # Root position returned **raw**, in the tracker's own OpenXR axes. Anything placing the
+        # operator in the world must convert with the runtime's own ``_OXR_TO_USD_ROTATION``, not
+        # with ``Q``: both send Y to height, so a mistake there looks like a correct height with
+        # the horizontal offset rotated 180 degrees.
+        return out_pos, out_rot, np.asarray(body_poses[ids[0]][:3], dtype=np.float32)
 
     def _xr_to_smpl_local(self, body_poses: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """XR global quaternions -> SMPL local axis-angle.

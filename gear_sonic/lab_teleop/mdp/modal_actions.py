@@ -75,6 +75,14 @@ SONIC_MODAL_ACTION_DIM = SONIC_REFERENCE_DIM + 1 + SONIC_PLANNER_COMMAND_DIM + 3
 #: Prim path of the scene's ground plane, toggled from the controller.
 GROUND_PLANE_PRIM_PATH = "/World/GroundPlane"
 
+#: OpenXR -> USD axis conversion, ``[x, y, z] -> [x, -z, y]``. Must match
+#: ``XrAnchorManager._OXR_TO_USD_ROTATION`` (``xr_anchor_manager.py:71``), because the runtime
+#: composes the anchor as ``R_anchor @ R_oxr_to_usd`` and anything predicting where the operator
+#: will appear has to use the same conversion. Note this is *not* the Unity matrix the
+#: ``vr_3point`` port uses: both map Y to height, so confusing them yields a correct height with
+#: the horizontal offset rotated 180 degrees.
+OXR_TO_USD = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
 #: Encoder mode ids, matching the checkpoint's ``encoder_modes``.
 ENCODER_MODE_TELEOP = 1
 ENCODER_MODE_SMPL = 2
@@ -461,7 +469,8 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         # Where the operator currently stands, in world terms: anchor + R(anchor_yaw) . pelvis.
         # Solving "operator lands on the robot" for the anchor gives the subtraction below.
         cos_y, sin_y = float(np.cos(self._anchor_yaw)), float(np.sin(self._anchor_yaw))
-        ox, oy = float(self._operator_root[0]), float(self._operator_root[1])
+        operator_usd = OXR_TO_USD @ self._operator_root
+        ox, oy = float(operator_usd[0]), float(operator_usd[1])
         offset_x = cos_y * ox - sin_y * oy
         offset_y = sin_y * ox + cos_y * oy
         self._xr_cfg.anchor_pos = (

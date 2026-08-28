@@ -227,19 +227,24 @@ def test_a_commanded_turn_reaches_the_planner_while_standing_still() -> None:
     assert len(headings) == before
 
 
-@pytest.mark.parametrize("drift", [(0.0, 0.0), (1.5, 0.0), (0.0, 2.0), (-2.5, 1.5)])
-def test_entering_teleop_puts_the_operator_on_the_robot(drift) -> None:  # noqa: ANN001
-    """The anchor is placed so the *operator* lands on the robot, not so the anchor does.
+@pytest.mark.parametrize(
+    "tracked", [(0.0, 0.9, 0.0), (1.5, 0.9, 0.0), (0.0, 0.9, 2.0), (-2.5, 0.9, 1.5)]
+)
+def test_entering_teleop_puts_the_operator_on_the_robot(tracked) -> None:  # noqa: ANN001
+    """The anchor must place the *operator* on the robot, per the runtime's own composition.
 
-    Those differ by however far room-scale walking carried the operator from the anchor origin,
-    which in tracking mode is the entire point and can be metres. Snapping the anchor itself to
-    the robot leaves that offset intact and the operator arrives beside the robot.
+    Checked by reproducing what ``XrAnchorManager`` does -- ``R_anchor @ R_oxr_to_usd`` applied to
+    the raw OpenXR pose, then translated -- rather than by re-using this module's own convention
+    on both sides, which would pass whatever transform we picked.
+
+    ``tracked`` is a raw OpenXR pelvis pose: Y is height, X and Z are the floor plane.
     """
     import numpy as np
     import torch
 
     from gear_sonic.lab_teleop.assets.g1_sonic import G1_MODEL_12_ACTION_SCALE
     from gear_sonic.lab_teleop.mdp.modal_actions import (
+        OXR_TO_USD,
         SONIC_MODAL_ACTION_DIM,
         SonicModalWholeBodyAction,
         SonicModalWholeBodyActionCfg,
@@ -249,6 +254,11 @@ def test_entering_teleop_puts_the_operator_on_the_robot(drift) -> None:  # noqa:
         SonicReferenceSlice,
     )
     from gear_sonic.lab_teleop.tests.sonic_action_harness import FakeArticulation, FakeEnv
+
+    # The conversion must equal the runtime's, or every prediction below is meaningless.
+    np.testing.assert_array_equal(
+        OXR_TO_USD, np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+    )
 
     class _Xr:
         anchor_pos = (0.0, 0.0, -0.19)
@@ -280,7 +290,7 @@ def test_entering_teleop_puts_the_operator_on_the_robot(drift) -> None:  # noqa:
     reference[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
     reference[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
     reference[SonicReferenceSlice.VALID] = 1.0
-    reference[SonicReferenceSlice.OPERATOR_ROOT_POS] = [drift[0], drift[1], 0.0]
+    reference[SonicReferenceSlice.OPERATOR_ROOT_POS] = tracked
 
     action = torch.zeros(1, SONIC_MODAL_ACTION_DIM)
     action[0, :SONIC_REFERENCE_DIM] = torch.from_numpy(reference)
@@ -289,7 +299,7 @@ def test_entering_teleop_puts_the_operator_on_the_robot(drift) -> None:  # noqa:
     action[0, base + 4] = 1.0
     action[0, base + 7] = -1.0
 
-    action[0, SONIC_REFERENCE_DIM] = 2.0  # tracking; operator walks away from the anchor
+    action[0, SONIC_REFERENCE_DIM] = 2.0  # tracking; the operator walks away from the anchor
     for _ in range(3):
         term.process_actions(action)
         term.apply_actions()
@@ -298,12 +308,11 @@ def test_entering_teleop_puts_the_operator_on_the_robot(drift) -> None:  # noqa:
     term.process_actions(action)
     term.apply_actions()
 
-    # Where the operator actually is: anchor + R(anchor_yaw) . tracked pelvis.
-    anchor = term._xr_cfg.anchor_pos  # noqa: SLF001
-    yaw = term._anchor_yaw  # noqa: SLF001
-    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-    operator = (
-        anchor[0] + cos_y * drift[0] - sin_y * drift[1],
-        anchor[1] + sin_y * drift[0] + cos_y * drift[1],
-    )
-    assert operator == pytest.approx(robot_xy, abs=1e-4)
+    # Reproduce XrAnchorManager._build_matrix: world = R_anchor @ R_oxr_to_usd @ p_oxr + anchor_pos
+    from scipy.spatial.transform import Rotation as sRot
+
+    anchor_pos = np.asarray(term._xr_cfg.anchor_pos, dtype=np.float64)  # noqa: SLF001
+    r_anchor = sRot.from_quat(np.asarray(term._xr_cfg.anchor_rot)).as_matrix()  # noqa: SLF001
+    operator_world = r_anchor @ OXR_TO_USD @ np.asarray(tracked) + anchor_pos
+
+    assert operator_world[:2] == pytest.approx(robot_xy, abs=1e-4)
