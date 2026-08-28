@@ -38,13 +38,13 @@ planner runs inside the action term, closed-loop on measured robot state.
 
 ## Prerequisites
 
-1. **Isaac Lab 3.0** (`3.0.0-beta2` or newer), as a **source checkout** — the stock teleoperation
-   scripts live under `scripts/` and are not shipped in the wheel, so a wheel-only install is not
-   enough.
+1. **Isaac Lab 3.0**, `develop` branch, as a **source checkout** — the stock teleoperation scripts
+   live under `scripts/` and are not shipped in the wheel, so a wheel-only install is not enough.
+   `develop` is the branch this integration is developed and tested against.
 
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
-   git clone https://github.com/isaac-sim/IsaacLab.git
+   git clone -b develop https://github.com/isaac-sim/IsaacLab.git
    cd IsaacLab
    uv run isaaclab --help     # first run creates .venv and installs dependencies
    ```

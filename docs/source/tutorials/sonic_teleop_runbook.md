@@ -6,14 +6,17 @@ Get a second machine running. For the controls, see
 ## 1. Install
 
 ```bash
-git clone https://github.com/isaac-sim/IsaacLab.git      # 3.0.0-beta2 or newer, source checkout
-cd IsaacLab && uv run isaaclab --help                    # creates .venv
+git clone -b develop https://github.com/isaac-sim/IsaacLab.git   # source checkout, develop branch
+cd IsaacLab && uv run isaaclab --help                           # creates .venv
 source $(pwd)/.venv/bin/activate
 
 cd /path/to/GR00T-WholeBodyControl
 pip install --no-deps -e ./gear_sonic                    # --no-deps is deliberate
 uv pip install --python $(which python) onnxruntime-gpu==1.22.0
 ```
+
+`develop` is what this branch is developed and tested against; the stock teleoperation scripts
+live under `scripts/` and ship only in a source checkout, not the wheel.
 
 The `onnxruntime-gpu` version must match your torch CUDA major: `1.22` for cu12x, `1.27+` for
 cu13. A plain `onnxruntime` anywhere in the environment shadows it — same module name, last one
