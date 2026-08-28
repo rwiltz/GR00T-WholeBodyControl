@@ -68,6 +68,11 @@ depends on how far you have drifted apart. Leaving walking mode freezes it where
 **A hitch about once a second while walking** is the planner re-planning. It costs ~10 ms in a
 single control step, inside the 20 ms budget.
 
+**One visible step change at the moment you switch modes.** The encoder changes mode, so its
+output moves in a single control step. Upstream cross-fades successive plans over 0.16 s; we do
+not blend yet, because the sustained instability turned out to be elsewhere. If this single step
+proves too abrupt in practice it is the next thing to add.
+
 **Startup takes about two seconds longer than it used to.** The motion planner is now built and
 warmed up before the first frame. It used to be built the first time you pressed into walking
 mode, which stalled the control loop for ~1.7 s -- 87 steps -- at exactly the moment the robot

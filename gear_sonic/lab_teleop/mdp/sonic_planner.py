@@ -48,13 +48,23 @@ import numpy as np
 import torch
 
 __all__ = [
+    "PLANNER_BLEND_S",
     "PLANNER_CLIP_IDLE",
     "PLANNER_CLIP_SLOW_WALK",
     "PLANNER_CLIP_WALK",
     "PLANNER_CONTEXT_FRAMES",
     "PLANNER_QPOS_DIM",
+    "PLANNER_DEFAULT_HEIGHT",
+    "PLANNER_LOOKAHEAD_S",
+    "PLANNER_NATIVE_DT",
+    "PLANNER_NATIVE_HZ",
+    "PLANNER_PERIODIC_REPLAN_S",
+    "PLANNER_TICK_S",
     "PLANNER_WALK_TOKENS",
     "SONIC_PLANNER_COMMAND_DIM",
+    "SONIC_REFERENCE_DT",
+    "SONIC_REFERENCE_HZ",
+    "PlannerMotion",
     "SonicVelocityPlanner",
 ]
 
@@ -66,6 +76,155 @@ PLANNER_QPOS_DIM = 36
 
 #: Operator command width: ``[target_vel, movement_dir(3), facing_dir(3), height]``.
 SONIC_PLANNER_COMMAND_DIM = 8
+
+#: **Planner model property.** The graph emits frames at 30 Hz regardless of what the simulation
+#: runs at, so this must never be derived from ``sim.dt``. Confirmed empirically as well as from
+#: ``docs/source/references/planner_onnx.md``: commanding a steady 0.5/0.8/1.0 m/s walk and
+#: measuring the per-frame root displacement over the settled tail of the plan implies 29.4/30.9/
+#: 32.5 Hz.
+PLANNER_NATIVE_HZ = 30.0
+PLANNER_NATIVE_DT = 1.0 / PLANNER_NATIVE_HZ
+
+#: **SONIC checkpoint property.** The reference timeline the encoder's ``Nframe_stepS`` windows are
+#: expressed on. ``step5`` means five ticks of *this* clock -- 0.1 s -- not five environment steps
+#: (``docs/source/references/observation_config.md:96``). Also never derived from ``sim.dt``.
+SONIC_REFERENCE_HZ = 50.0
+SONIC_REFERENCE_DT = 1.0 / SONIC_REFERENCE_HZ
+
+#: Planner look-ahead when building context from the current plan: upstream's
+#: ``motion_look_ahead_steps = 2`` at 50 Hz (``localmotion_kplanner.hpp:215``).
+PLANNER_LOOKAHEAD_S = 2.0 * SONIC_REFERENCE_DT
+
+#: Cross-fade duration between an old and a newly arrived plan: upstream's 8-frame blend at 50 Hz.
+PLANNER_BLEND_S = 8.0 * SONIC_REFERENCE_DT
+
+#: Planner thread cadence upstream (10 Hz) and the periodic replan interval for walking.
+PLANNER_TICK_S = 0.1
+PLANNER_PERIODIC_REPLAN_S = 1.0
+
+#: Standing height the upstream planner canonicalizes its initial context to
+#: (``InitializeContext``: x = y = 0, z = default height, identity quaternion).
+PLANNER_DEFAULT_HEIGHT = 0.78
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
+    """Shortest-arc spherical interpolation between two wxyz quaternions.
+
+    Args:
+        q0: ``(4,)`` start quaternion, wxyz.
+        q1: ``(4,)`` end quaternion, wxyz.
+        alpha: Interpolation weight in ``[0, 1]``.
+
+    Returns:
+        ``(4,)`` interpolated unit quaternion, wxyz.
+    """
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:  # take the shorter arc; q and -q are the same rotation
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:  # nearly parallel: lerp is numerically better behaved than slerp
+        out = q0 + alpha * (q1 - q0)
+        return out / (np.linalg.norm(out) + 1e-12)
+    theta = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_theta = np.sin(theta)
+    return (np.sin((1.0 - alpha) * theta) * q0 + np.sin(alpha * theta) * q1) / sin_theta
+
+
+class PlannerMotion:
+    """A planned trajectory resampled onto SONIC's reference clock, sampled by *time*.
+
+    The planner graph speaks 30 Hz and SONIC speaks 50 Hz. Keeping the two apart is the whole
+    point of this class: a bare array of planner frames invites the reader to advance it one entry
+    per control step, which plays the motion at ``50/30 = 1.67x``. Everything here is addressed in
+    seconds.
+
+    Mirrors ``ResampleGeneratedSequence50Hz`` in the deployment stack: linear interpolation for
+    joint and root positions, slerp for the root quaternion, and joint velocities finite-differenced
+    from the *resampled* series so they carry the right timestep
+    (``docs/source/references/planner_onnx.md:387-396``).
+
+    Attributes:
+        dt: Sample spacing of the resampled trajectory, ``SONIC_REFERENCE_DT``.
+        qpos: ``(frames, 36)`` resampled poses: 3 root position, 4 root quaternion (wxyz), 29 joints.
+        qvel: ``(frames, 29)`` joint velocities derived from :attr:`qpos`.
+    """
+
+    def __init__(self, native_qpos: np.ndarray, native_dt: float = PLANNER_NATIVE_DT) -> None:
+        """Resample a native-rate plan onto the reference clock.
+
+        Args:
+            native_qpos: ``(n, 36)`` planner output at ``native_dt`` spacing.
+            native_dt: Sample spacing of ``native_qpos``. Defaults to the planner's 30 Hz.
+        """
+        native = np.asarray(native_qpos, dtype=np.float32).reshape(-1, PLANNER_QPOS_DIM)
+        self.dt = SONIC_REFERENCE_DT
+        n_native = len(native)
+        # Upstream keeps num_pred_frames * 50/30 frames, rounded down.
+        n_out = max(1, int(np.floor((n_native - 1) * native_dt / self.dt)) + 1)
+
+        self.qpos = np.empty((n_out, PLANNER_QPOS_DIM), dtype=np.float32)
+        for k in range(n_out):
+            f = (k * self.dt) / native_dt
+            f0 = min(int(np.floor(f)), n_native - 1)
+            f1 = min(f0 + 1, n_native - 1)
+            alpha = float(f - f0)
+            a, b = native[f0], native[f1]
+            self.qpos[k, :3] = a[:3] + alpha * (b[:3] - a[:3])
+            self.qpos[k, 3:7] = _slerp(a[3:7], b[3:7], alpha)
+            self.qpos[k, 7:] = a[7:] + alpha * (b[7:] - a[7:])
+
+        # Finite difference on the resampled series, holding the last frame's velocity.
+        self.qvel = np.zeros((n_out, PLANNER_QPOS_DIM - 7), dtype=np.float32)
+        if n_out > 1:
+            self.qvel[:-1] = (self.qpos[1:, 7:] - self.qpos[:-1, 7:]) / self.dt
+            self.qvel[-1] = self.qvel[-2]
+
+    @property
+    def duration(self) -> float:
+        """Play time of the trajectory, in seconds."""
+        return (len(self.qpos) - 1) * self.dt
+
+    def _frame_at(self, t: float) -> tuple[int, int, float]:
+        """Bracketing frame indices and blend weight for time ``t``, clamped to the ends.
+
+        Clamping rather than wrapping matches the encoder's own out-of-range rule: "if future
+        frames exceed the motion length, the last frame is repeated"
+        (``docs/source/references/observation_config.md:99``).
+        """
+        f = max(0.0, t) / self.dt
+        f0 = min(int(np.floor(f)), len(self.qpos) - 1)
+        f1 = min(f0 + 1, len(self.qpos) - 1)
+        return f0, f1, float(min(max(f - f0, 0.0), 1.0))
+
+    def sample_qpos(self, t: float) -> np.ndarray:
+        """Pose at time ``t`` seconds into the trajectory."""
+        f0, f1, alpha = self._frame_at(t)
+        a, b = self.qpos[f0], self.qpos[f1]
+        out = np.empty(PLANNER_QPOS_DIM, dtype=np.float32)
+        out[:3] = a[:3] + alpha * (b[:3] - a[:3])
+        out[3:7] = _slerp(a[3:7], b[3:7], alpha)
+        out[7:] = a[7:] + alpha * (b[7:] - a[7:])
+        return out
+
+    def sample_joints(self, times: np.ndarray, joint_indices: np.ndarray) -> np.ndarray:
+        """Joint positions and velocities for a set of sample times.
+
+        Args:
+            times: ``(k,)`` times in seconds from the start of the trajectory.
+            joint_indices: Indices selecting and ordering the joints to return.
+
+        Returns:
+            ``(positions, velocities)``, each ``(k, len(joint_indices))``.
+        """
+        pos = np.empty((len(times), len(joint_indices)), dtype=np.float32)
+        vel = np.empty_like(pos)
+        for i, t in enumerate(times):
+            f0, f1, alpha = self._frame_at(float(t))
+            jp = self.qpos[:, 7:]
+            pos[i] = (jp[f0] + alpha * (jp[f1] - jp[f0]))[joint_indices]
+            vel[i] = (self.qvel[f0] + alpha * (self.qvel[f1] - self.qvel[f0]))[joint_indices]
+        return pos, vel
+
 
 #: Planner clip ids, indexing ``clip_holder_G1.CLIPS`` (``motionbricks/.../demo/clips.py:131``).
 #:
@@ -93,8 +252,6 @@ class SonicVelocityPlanner:
         checkpoint_path: Path to ``planner_sonic.onnx``.
         device: Torch device for the returned tensors. Inference itself runs through onnxruntime;
             the graph is small next to the SONIC decoder.
-        replan_interval: Frames to consume before re-planning. ``0`` consumes the whole valid
-            plan, which is ``num_pred_frames`` long -- not necessarily the full 64.
         allowed_tokens: Clip token mask; see :data:`PLANNER_WALK_TOKENS`.
         warmup: Run one throwaway inference during construction. The first call into a fresh
             onnxruntime session pays lazy kernel and CUDA-graph setup -- measured at ~490 ms
@@ -109,7 +266,6 @@ class SonicVelocityPlanner:
         self,
         checkpoint_path: str | pathlib.Path,
         device: torch.device | str = "cuda:0",
-        replan_interval: int = 0,
         allowed_tokens: tuple[int, ...] = PLANNER_WALK_TOKENS,
         warmup: bool = True,
     ) -> None:
@@ -131,12 +287,9 @@ class SonicVelocityPlanner:
         self._session = ort.InferenceSession(str(path), options, providers=providers)
         self._input_names = {i.name for i in self._session.get_inputs()}
         self._horizon = self._session.get_outputs()[0].shape[1]
-        self._replan_interval = replan_interval
         self._allowed_tokens = tuple(allowed_tokens)
 
         self._context = np.zeros((1, PLANNER_CONTEXT_FRAMES, PLANNER_QPOS_DIM), dtype=np.float32)
-        self._plan: np.ndarray | None = None
-        self._cursor = 0
         self._seeded = False
 
         if warmup:
@@ -150,7 +303,8 @@ class SonicVelocityPlanner:
         """
         self._context[0, :, 2] = 0.76  # hip height
         self._context[0, :, 3] = 1.0  # wxyz identity root quaternion
-        self._run(np.array([0.0, 1, 0, 0, 1, 0, 0, 0.76], dtype=np.float32), PLANNER_CLIP_WALK)
+        self.plan(np.array([0.0, 1, 0, 0, 1, 0, 0, PLANNER_DEFAULT_HEIGHT], dtype=np.float32),
+                  PLANNER_CLIP_WALK)
         self.reset()
 
     @property
@@ -161,12 +315,10 @@ class SonicVelocityPlanner:
     def reset(self) -> None:
         """Drop the context history and any pending plan.
 
-        Mandatory on episode reset. A retained plan describes the *previous* episode's motion, and
-        a retained context conditions the next plan on a pose the robot no longer has.
+        Mandatory on episode reset: a retained context conditions the next plan on a pose the
+        robot no longer has. The trajectory itself is owned by the caller.
         """
         self._context[:] = 0.0
-        self._plan = None
-        self._cursor = 0
         self._seeded = False
 
     def set_context(self, history: np.ndarray) -> None:
@@ -226,8 +378,20 @@ class SonicVelocityPlanner:
         facing = facing / (np.linalg.norm(facing) + 1e-5)
         return movement.astype(np.float32), facing.astype(np.float32)
 
-    def _run(self, command: np.ndarray, mode: int) -> None:
-        """Invoke the graph and refill the plan buffer."""
+    def plan(self, command: np.ndarray, mode: int = PLANNER_CLIP_WALK) -> PlannerMotion:
+        """Run the graph once and return the whole planned trajectory.
+
+        Returns a trajectory rather than a frame on purpose. The previous ``next_frame`` API handed
+        back one native 30 Hz frame per call, and the caller advanced it once per 50 Hz control
+        step -- playing every plan at 1.67x.
+
+        Args:
+            command: ``(8,)`` ``[target_vel, movement_dir(3), facing_dir(3), height]``.
+            mode: Planner clip id; see :data:`PLANNER_CLIP_WALK`.
+
+        Returns:
+            The planned motion, resampled onto SONIC's reference clock.
+        """
         target_vel = np.asarray([command[0]], dtype=np.float32)
         movement = np.asarray(command[1:4], dtype=np.float32).reshape(1, 3)
         facing = np.asarray(command[4:7], dtype=np.float32).reshape(1, 3)
@@ -257,30 +421,52 @@ class SonicVelocityPlanner:
                 feeds[name] = value
 
         outputs = self._session.run(None, feeds)
-        plan = np.asarray(outputs[0], dtype=np.float32).reshape(-1, PLANNER_QPOS_DIM)
+        native = np.asarray(outputs[0], dtype=np.float32).reshape(-1, PLANNER_QPOS_DIM)
         # The output tensor is always 64 frames wide, but only ``num_pred_frames`` of them are
         # predictions -- 44 under the walking token mask. Consuming the tail would replay
         # uninitialized frames as if they were motion.
         num_valid = int(np.asarray(outputs[1]).reshape(-1)[0])
-        self._plan = plan[: max(1, min(num_valid, len(plan)))]
-        self._cursor = 0
+        return PlannerMotion(native[: max(2, min(num_valid, len(native)))])
 
-    def next_frame(self, command: np.ndarray, mode: int = PLANNER_CLIP_WALK) -> np.ndarray:
-        """Return the next planned pose, re-planning when the buffer runs dry.
+    def initialize_from_robot(self, joint_positions: np.ndarray) -> PlannerMotion:
+        """Build the first trajectory when the operator enters walking mode.
+
+        Reproduces upstream ``Initialize`` / ``InitializeContext``
+        (``localmotion_kplanner.hpp:332,591``): the context is canonicalized to the origin at the
+        default standing height with an identity (zero-yaw) quaternion, carrying only the robot's
+        *current joint positions*, and the first inference is an IDLE plan with no movement.
+
+        The canonicalization is deliberate and is not a loss of fidelity: the planner works in its
+        own canonical frame and the caller re-anchors the result. Feeding the robot's true world
+        pose here would ask the graph to extrapolate from a position it never trains on.
 
         Args:
-            command: ``(8,)`` ``[target_vel, movement_dir(3), facing_dir(3), height]``.
-            mode: Planner clip id; see :data:`PLANNER_CLIP_WALK`. Defaults to walking, because the
-                idle clip ignores ``target_vel`` entirely.
+            joint_positions: ``(29,)`` measured joint positions in MuJoCo order.
 
         Returns:
-            ``(36,)`` planned MuJoCo-order pose.
+            A valid idle trajectory, ready to sample before the first teleop observation is built.
         """
-        limit = len(self._plan) if self._plan is not None else 0
-        if self._replan_interval:
-            limit = min(self._replan_interval, limit)
-        if self._plan is None or self._cursor >= limit:
-            self._run(np.asarray(command, dtype=np.float32).reshape(-1), mode)
-        frame = self._plan[self._cursor]
-        self._cursor += 1
-        return frame
+        self._context[:] = 0.0
+        self._context[0, :, 2] = PLANNER_DEFAULT_HEIGHT
+        self._context[0, :, 3] = 1.0  # wxyz identity
+        self._context[0, :, 7:] = np.asarray(joint_positions, dtype=np.float32).reshape(1, -1)
+        self._seeded = True
+        idle = np.array([0.0, 1, 0, 0, 1, 0, 0, PLANNER_DEFAULT_HEIGHT], dtype=np.float32)
+        return self.plan(idle, PLANNER_CLIP_IDLE)
+
+    def context_from_motion(self, motion: PlannerMotion, gen_time: float) -> None:
+        """Refill the context by sampling the *current plan*, as upstream does.
+
+        Upstream's ``UpdateContextFromMotion`` samples four frames at 30 Hz spacing starting at
+        ``gen_frame = current_frame + motion_look_ahead_steps``, taken from the planner motion
+        rather than from measured robot state. Replanning from the plan keeps successive
+        trajectories continuous with each other; replanning from the robot would fold whatever
+        tracking error the controller has into the next plan's starting pose.
+
+        Args:
+            motion: Trajectory currently being played.
+            gen_time: Time in the trajectory at which the next plan should begin.
+        """
+        for n in range(PLANNER_CONTEXT_FRAMES):
+            self._context[0, n] = motion.sample_qpos(gen_time + n * PLANNER_NATIVE_DT)
+        self._seeded = True

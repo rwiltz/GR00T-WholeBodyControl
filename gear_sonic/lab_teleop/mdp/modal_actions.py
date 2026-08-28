@@ -45,8 +45,12 @@ from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyAction, SonicWholeBo
 from gear_sonic.lab_teleop.mdp.sonic_planner import (
     PLANNER_CLIP_WALK,
     PLANNER_CONTEXT_FRAMES,
+    PLANNER_LOOKAHEAD_S,
+    PLANNER_PERIODIC_REPLAN_S,
     PLANNER_QPOS_DIM,
     SONIC_PLANNER_COMMAND_DIM,
+    SONIC_REFERENCE_DT,
+    PlannerMotion,
     SonicVelocityPlanner,
 )
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
@@ -73,28 +77,46 @@ ENCODER_MODE_SMPL = 2
 
 #: Encoder slots ``teleop`` mode populates, recovered from the graph's ``Slice`` nodes.
 TELEOP_ANCHOR_ORI = slice(644, 650)  # single frame, 6D rotation
-TELEOP_LOWER_BODY = slice(650, 890)  # 10 frames x (12 pos + 12 vel)
+#: Two *separate contiguous blocks*, not interleaved per frame: the encoder declares
+#: ``motion_joint_positions_lowerbody_10frame_step5`` (120) followed by
+#: ``motion_joint_velocities_lowerbody_10frame_step5`` (120). Each is frame-major -- 10 frames of
+#: 12 joints (``g1_deploy_onnx_ref.cpp:1735``, ``GatherMotionJointPositionsMultiFrame``).
+TELEOP_LOWER_POS = slice(650, 770)
+TELEOP_LOWER_VEL = slice(770, 890)
+TELEOP_LOWER_BODY = slice(650, 890)
 TELEOP_VR3_POS = slice(890, 899)  # head + 2 hands, xyz
 TELEOP_VR3_ORN = slice(899, 911)  # head + 2 hands, 4-wide each
 
-#: Lower-body joints the ``teleop`` block carries, in Isaac Lab order.
+#: The twelve leg joints the ``teleop`` block carries, **in the order the encoder wants them**:
+#: whole left leg, then whole right leg. That is MuJoCo's grouping, not Isaac Lab's interleaved
+#: left/right one, and it is spelled out upstream as indices into the Isaac Lab ordering --
+#: ``lower_body_joint_mujoco_order_in_isaaclab_index = {0,3,6,9,13,17, 1,4,7,10,14,18}``
+#: (``policy_parameters.hpp:92``).
 LOWER_BODY_JOINTS = (
     "left_hip_pitch_joint",
-    "right_hip_pitch_joint",
     "left_hip_roll_joint",
-    "right_hip_roll_joint",
     "left_hip_yaw_joint",
-    "right_hip_yaw_joint",
     "left_knee_joint",
-    "right_knee_joint",
     "left_ankle_pitch_joint",
-    "right_ankle_pitch_joint",
     "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
     "right_ankle_roll_joint",
 )
 
+#: Isaac Lab joint indices for :data:`LOWER_BODY_JOINTS`, matching ``policy_parameters.hpp:92``.
+LOWER_BODY_ISAACLAB_INDICES = (0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18)
+
 #: Reference frames the ``teleop`` lower-body block spans.
 TELEOP_REFERENCE_FRAMES = 10
+
+#: Spacing of those frames on SONIC's reference clock: ``step5`` = 5 ticks at 50 Hz = 0.1 s, so
+#: the window looks 0.9 s into the future (``observation_config.md:96-99``). Expressed as a
+#: duration, not a frame count, so it stays correct if the environment's control rate changes.
+TELEOP_REFERENCE_STRIDE_S = 5.0 * SONIC_REFERENCE_DT
 
 #: SMPL joint indices, into the reference's 24-joint **root-local** block, for the three points
 #: ``vr_3point`` carries. Shared with the retargeter, which uses the same three joints to build
@@ -124,6 +146,11 @@ class SonicModalWholeBodyActionCfg(SonicWholeBodyActionCfg):
     """Planner gait/style clip. **Not** the SONIC encoder mode; clip 0 is idle and ignores speed."""
 
     planner_replan_interval: int = 0
+
+    #: Print a one-off trace of the SMPL -> teleop handoff: the discontinuity between the robot's
+    #: measured legs and the first planned pose, the planned velocity scale, and every clock in
+    #: play. Off by default -- this is a diagnostic for the transition, not routine logging.
+    debug_transitions: bool = False
     """Frames consumed before re-planning. ``0`` consumes each plan fully."""
 
     anchor_pan_speed: float = 1.0
@@ -180,10 +207,18 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._lower_body_ids = torch.as_tensor(lower_ids, device=self.device)
         #: Rolling window of planned lower-body pos+vel, oldest first, mirroring the encoder's
         #: expectation of a 10-frame history.
-        self._lower_history = np.zeros(
-            (TELEOP_REFERENCE_FRAMES, 2 * len(LOWER_BODY_JOINTS)), dtype=np.float32
+        #: Trajectory currently being played, and how far into it we are. The plan is addressed
+        #: by *time*, not by frame index: it is generated at 30 Hz, resampled to SONIC's 50 Hz
+        #: reference clock, and consumed at whatever the environment's control rate is.
+        self._motion: PlannerMotion | None = None
+        self._plan_time = 0.0
+        self._since_replan = 0.0
+        self._last_command: np.ndarray | None = None
+        #: Sample times of the encoder's look-ahead window, in seconds from the current plan time.
+        self._reference_offsets = (
+            np.arange(TELEOP_REFERENCE_FRAMES, dtype=np.float32) * TELEOP_REFERENCE_STRIDE_S
         )
-        self._prev_lower_pos: np.ndarray | None = None
+        self._lower_indices = np.asarray(LOWER_BODY_ISAACLAB_INDICES, dtype=np.int64)
         self._qpos_scratch = np.zeros(PLANNER_QPOS_DIM, dtype=np.float32)
         #: Rolling measured-pose history feeding the planner's context.
         #:
@@ -196,6 +231,29 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._qpos_history = np.zeros((PLANNER_CONTEXT_FRAMES, PLANNER_QPOS_DIM), dtype=np.float32)
         self._qpos_seeded = False
         self._mode = ENCODER_MODE_SMPL
+
+        #: The environment's control period. Prefer Isaac Lab's canonical ``step_dt`` over
+        #: recomputing ``sim.dt * decimation`` so there is one authority for it.
+        #:
+        #: Distinct from three other clocks that must not be conflated: physics (``sim.dt``),
+        #: render (``sim.dt * render_interval``, 100 Hz here and irrelevant to control), the
+        #: planner's native 30 Hz, and SONIC's own 50 Hz reference rate.
+        self._control_dt = float(getattr(env, "step_dt", 0.0)) or float(
+            getattr(getattr(env.cfg, "sim", None), "dt", 0.005)
+        ) * float(getattr(env.cfg, "decimation", 4))
+        if abs(self._control_dt - SONIC_REFERENCE_DT) > 1e-6:
+            # SONIC's reference windows are defined in ticks of its own 50 Hz clock, and its
+            # decoder was trained at that rate. Running the environment at a different control
+            # rate would silently reinterpret every temporal observation, so refuse rather than
+            # quietly change the model's semantics. The planner path resamples by time and would
+            # cope; the policy itself is what does not.
+            raise ValueError(
+                f"SONIC requires a {1 / SONIC_REFERENCE_DT:.0f} Hz control rate "
+                f"(step_dt = {SONIC_REFERENCE_DT}), but this environment steps at "
+                f"{self._control_dt:.5f} s ({1 / self._control_dt:.1f} Hz). "
+                "Set sim.dt and decimation so their product is 0.02 -- e.g. 1/200 with "
+                "decimation 4, or 1/100 with decimation 2."
+            )
 
         from gear_sonic.lab_teleop.assets.g1_sonic import G1_ISAACLAB_TO_MUJOCO_MAPPING
 
@@ -244,8 +302,6 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         super().reset(env_ids)
         if self._planner is not None:
             self._planner.reset()
-        self._lower_history[:] = 0.0
-        self._prev_lower_pos = None
         self._mode = ENCODER_MODE_SMPL
         self._prev_mode = ENCODER_MODE_SMPL
         self._anchor_yaw = None
@@ -253,6 +309,10 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._restore_anchor()
         self._qpos_history[:] = 0.0
         self._qpos_seeded = False
+        self._motion = None
+        self._plan_time = 0.0
+        self._since_replan = 0.0
+        self._last_command = None
         self._ground_visible = None
 
     def _build_planner(self) -> SonicVelocityPlanner:
@@ -260,7 +320,6 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         return SonicVelocityPlanner(
             checkpoint_path=self._planner_checkpoint,
             device=self._policy_device,
-            replan_interval=self.cfg.planner_replan_interval,
         )
 
     def _ensure_planner(self) -> SonicVelocityPlanner:
@@ -362,7 +421,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         if self._prev_mode != ENCODER_MODE_TELEOP or self._anchor_yaw is None:
             self._anchor_yaw = yaw  # snap on entry, no blend from a stale heading
         else:
-            dt = float(getattr(self._env, "step_dt", 0.02))
+            dt = self._control_dt
             alpha = 1.0 - float(np.exp(-dt / max(ANCHOR_YAW_SMOOTHING_TIME, 1e-6)))
             delta = (yaw - self._anchor_yaw + np.pi) % (2.0 * np.pi) - np.pi
             self._anchor_yaw += float(np.clip(alpha, 0.05, 1.0)) * delta
@@ -394,7 +453,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         if target_vel <= 1e-4:
             return
         direction = self._pan_command[1:4]
-        dt = float(getattr(self._env, "step_dt", 0.02))
+        dt = self._control_dt
         step = target_vel * speed * dt
         pos = self._xr_cfg.anchor_pos
         self._xr_cfg.anchor_pos = (
@@ -457,47 +516,114 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             self._qpos_history[:-1] = self._qpos_history[1:]
             self._qpos_history[-1] = frame
 
-    def _advance_planner(self, command: np.ndarray) -> None:
-        """Run the planner and push one frame of lower-body pos+vel into the history."""
+    def _enter_teleop(self) -> None:
+        """Build the first trajectory for a fresh entry into walking mode.
+
+        Mirrors upstream ``Initialize``: canonical context, an IDLE zero-movement plan, resampled
+        onto the reference clock -- and only then is the teleop encoder given anything. The
+        operator must never see a partially initialized reference, so this runs to completion
+        before the first teleop observation is assembled.
+        """
         planner = self._ensure_planner()
-        planner.set_context(self._qpos_history)
+        joints_mujoco = self._robot_qpos()[7:]
+        self._motion = planner.initialize_from_robot(joints_mujoco)
+        self._plan_time = 0.0
+        self._since_replan = 0.0
+        self._last_command = None
+        if self.cfg.debug_transitions:
+            self._log_transition()
+
+    def _log_transition(self) -> None:
+        """Trace the SMPL -> teleop handoff, so a bad transition is measurable rather than felt."""
+        robot_mujoco = self._robot_qpos()
+        robot_legs = robot_mujoco[7:][self._isaaclab_to_mujoco][self._lower_indices]
+        times = self._plan_time + self._reference_offsets
+        pos, vel = self._motion.sample_joints(times, self._lower_indices)
+        delta = pos[0] - robot_legs
+        print(
+            "[SONIC] smpl -> teleop handoff\n"
+            f"    clocks: control {self._control_dt * 1e3:.1f} ms | "
+            f"SONIC reference {SONIC_REFERENCE_DT * 1e3:.1f} ms | "
+            f"planner native {1e3 / 30.0:.1f} ms\n"
+            f"    look-ahead window: {times[0] - self._plan_time:.2f}..."
+            f"{times[-1] - self._plan_time:.2f} s in {len(times)} samples\n"
+            f"    plan: {len(self._motion.qpos)} frames, {self._motion.duration:.2f} s\n"
+            f"    first planned legs vs measured: L2 {np.linalg.norm(delta):.4f} rad, "
+            f"max |delta| {np.abs(delta).max():.4f} rad\n"
+            f"    planned leg velocity: max |qvel| {np.abs(vel).max():.3f} rad/s",
+            flush=True,
+        )
+
+    def _replan_needed(self, command: np.ndarray) -> bool:
+        """Whether this control step should generate a new trajectory.
+
+        Time-based, mirroring the upstream planner thread rather than counting environment frames:
+        always replan when the operator's command changes, replan periodically only while actually
+        moving, and replan when the current plan is about to run out
+        (``planner_onnx.md:362-385``).
+        """
+        if self._motion is None:
+            return True
+        if self._last_command is None or not np.allclose(command, self._last_command, atol=1e-4):
+            return True
+        # Keep enough trajectory ahead to fill the encoder's look-ahead window.
+        if self._plan_time + float(self._reference_offsets[-1]) >= self._motion.duration:
+            return True
+        moving = float(command[0]) > 1e-4
+        return moving and self._since_replan >= PLANNER_PERIODIC_REPLAN_S
+
+    def _advance_planner(self, command: np.ndarray, dt: float) -> None:
+        """Advance plan time by one control step, replanning when required.
+
+        Args:
+            command: ``(8,)`` operator command in world frame.
+            dt: The environment's control period, in seconds.
+        """
+        planner = self._ensure_planner()
 
         if float(command[0]) <= 1e-4:
-            # No operator input: continue from measured motion rather than a stale command, as the
-            # reference implementation does. Needs robot state, hence here rather than upstream.
+            # No operator input: continue along the robot's own measured motion rather than a
+            # stale commanded heading, as the reference implementation does.
             movement, facing = SonicVelocityPlanner.idle_directions(self._qpos_history)
             command = command.copy()
             command[1:4] = movement
             command[4:7] = facing
 
-        frame = planner.next_frame(command, mode=self._planner_clip)
-        # Planned joints are MuJoCo-ordered; take the lower body back in Isaac Lab order.
-        planned_joints = frame[7:][self._isaaclab_to_mujoco]
-        lower_pos = planned_joints[: len(LOWER_BODY_JOINTS)]
-
-        dt = self._env.step_dt if hasattr(self._env, "step_dt") else 0.02
-        if self._prev_mode != ENCODER_MODE_TELEOP:
-            # Differencing against the last frame of a previous excursion would manufacture a huge
-            # spurious velocity across the gap.
-            self._prev_lower_pos = None
-        if self._prev_lower_pos is None:
-            lower_vel = np.zeros_like(lower_pos)
+        if self._replan_needed(command):
+            if self._motion is None:
+                self._enter_teleop()
+            else:
+                # Context comes from the plan being played, not from measured robot state, so
+                # successive trajectories are continuous with one another. Sampled a short
+                # look-ahead in, because the new plan takes effect a step or two from now.
+                planner.context_from_motion(self._motion, self._plan_time + PLANNER_LOOKAHEAD_S)
+                self._motion = planner.plan(command, mode=self._planner_clip)
+                self._plan_time = 0.0
+            self._since_replan = 0.0
+            self._last_command = command.copy()
         else:
-            lower_vel = (lower_pos - self._prev_lower_pos) / max(dt, 1e-6)
-        self._prev_lower_pos = lower_pos.copy()
+            self._plan_time += dt
+            self._since_replan += dt
 
-        if self._prev_mode != ENCODER_MODE_TELEOP:
-            # Entering teleop: backfill the whole window with this frame rather than continuing a
-            # window whose older frames come from a previous walk, possibly minutes ago. Mixing
-            # them would hand the encoder a reference trajectory that jumps discontinuously
-            # between two unrelated excursions. Same priming semantics as the proprioception
-            # history uses after a reset.
-            self._lower_history[:, : len(LOWER_BODY_JOINTS)] = lower_pos
-            self._lower_history[:, len(LOWER_BODY_JOINTS) :] = lower_vel
-        else:
-            self._lower_history[:-1] = self._lower_history[1:]
-            self._lower_history[-1, : len(LOWER_BODY_JOINTS)] = lower_pos
-            self._lower_history[-1, len(LOWER_BODY_JOINTS) :] = lower_vel
+    def _fill_lower_body(self) -> None:
+        """Write the encoder's 0.9 s look-ahead window of planned leg motion.
+
+        Two contiguous frame-major blocks -- all ten frames of positions, then all ten of
+        velocities -- sampled at ``current plan time + i * 0.1 s``. This is a window into the
+        *future* of the plan, which is what ``10frame_step5`` means
+        (``observation_config.md:96-99``); the previous implementation supplied a trailing history
+        of poses the robot had already been through, at the wrong spacing, with positions and
+        velocities interleaved into each other's slots.
+        """
+        obs = self._policy.encoder_obs
+        times = self._plan_time + self._reference_offsets
+        pos, vel = self._motion.sample_joints(times, self._lower_indices)
+        obs[:, TELEOP_LOWER_POS] = torch.as_tensor(
+            pos.reshape(-1), device=self.device
+        ).unsqueeze(0)
+        obs[:, TELEOP_LOWER_VEL] = torch.as_tensor(
+            vel.reshape(-1), device=self.device
+        ).unsqueeze(0)
 
     def _write_mode_slots(self, mode: int) -> None:
         """Write the encoder's mode id and one-hot, which are per-step under mode switching."""
@@ -518,8 +644,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         obs[:, variant.smpl_anchor_ori] = 0.0
         obs[:, variant.wrist_joint_pos] = 0.0
 
-        lower = torch.as_tensor(self._lower_history, device=self.device).reshape(1, -1)
-        obs[:, TELEOP_LOWER_BODY] = lower
+        self._fill_lower_body()
 
         # Single-frame anchor orientation, same maths as smpl mode over one frame.
         root_quat = reference[:, None, SonicReferenceSlice.ROOT_QUAT]
@@ -591,7 +716,11 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         if self._mode == ENCODER_MODE_TELEOP:
             # Planner runs outside inference_mode: it is numpy/onnxruntime and reads articulation
             # state, which the surrounding context does not need to guard.
-            self._advance_planner(command)
+            if self._prev_mode != ENCODER_MODE_TELEOP:
+                # Fresh entry: initialize fully before anything reads the plan, so the encoder
+                # never sees a half-built teleop reference.
+                self._enter_teleop()
+            self._advance_planner(command, self._control_dt)
 
         from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz
 
