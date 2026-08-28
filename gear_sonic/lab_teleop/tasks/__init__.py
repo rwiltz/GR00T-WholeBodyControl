@@ -41,6 +41,11 @@ SONIC_TELEOP_G1_LOW_LATENCY_BARE_TASK_ID = (
 )
 """Low-latency id with the manipulation props removed, for locomotion work and headroom."""
 
+SONIC_TELEOP_G1_LOW_LATENCY_BARE_REPLAY_TASK_ID = (
+    "IsaacContrib-Teleop-Sonic-WholeBody-G1-LowLatency-Bare-Replay-v0"
+)
+"""MCAP-replay id for the props-free low-latency env, for measuring SONIC's own timing."""
+
 
 gym.register(
     id=SONIC_TELEOP_G1_TASK_ID,
@@ -95,7 +100,19 @@ gym.register(
     disable_env_checker=True,
 )
 
+gym.register(
+    id=SONIC_TELEOP_G1_LOW_LATENCY_BARE_REPLAY_TASK_ID,
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": (
+            "gear_sonic.lab_teleop.sonic_teleop_env_cfg:SonicTeleopG1LowLatencyBareReplayEnvCfg"
+        ),
+    },
+    disable_env_checker=True,
+)
+
 __all__ = [
+    "SONIC_TELEOP_G1_LOW_LATENCY_BARE_REPLAY_TASK_ID",
     "SONIC_TELEOP_G1_LOW_LATENCY_BARE_TASK_ID",
     "SONIC_TELEOP_G1_LOW_LATENCY_REPLAY_TASK_ID",
     "SONIC_TELEOP_G1_LOW_LATENCY_TASK_ID",

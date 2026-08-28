@@ -453,6 +453,29 @@ class SonicTeleopG1LowLatencyBareEnvCfg(SonicTeleopG1LowLatencyEnvCfg):
         self.scene.steering_wheel = None
 
 
+
+@configclass
+class SonicTeleopG1LowLatencyBareReplayEnvCfg(SonicTeleopG1LowLatencyBareEnvCfg):
+    """The props-free low-latency environment, wired for MCAP replay.
+
+    Exists because the two axes are independent and both matter: ``Bare`` removes the manipulation
+    props, ``Replay`` swaps in the vendor-less pipeline ``SessionMode.REPLAY`` requires. Inheriting
+    one does not give you the other -- replaying against the live bare env fails outright with
+    "Vendor selection is only valid in SessionMode.LIVE".
+
+    This is the configuration to measure SONIC's own timing in: the packing table and its crates
+    cost roughly 7.7 ms per frame, which dominates any change to the controller itself.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        from gear_sonic.lab_teleop.retargeters.pipeline import (
+            make_sonic_full_pipeline_builder,
+        )
+
+        self.isaac_teleop.pipeline_builder = make_sonic_full_pipeline_builder(vendor=None)
+
 def checkpoint_dir_or_raise(path: str | pathlib.Path | None = None) -> str:
     """Return a validated SONIC checkpoint directory.
 
