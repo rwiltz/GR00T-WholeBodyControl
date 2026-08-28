@@ -151,3 +151,81 @@ def test_position_and_velocity_blocks_do_not_overlap() -> None:
         TELEOP_LOWER_BODY.start,
         TELEOP_LOWER_BODY.stop,
     )
+
+
+def test_joint_mapping_is_a_gather_resolved_by_name() -> None:
+    """``isaaclab_to_mujoco_dof`` is a gather: ``mujoco[i] = isaaclab[m[i]]``.
+
+    Resolved by **name**, not by index arithmetic. The previous test in this file compared an
+    index list against the one in ``policy_parameters.hpp`` and stopped there, which cannot
+    detect the array being applied in the wrong direction -- both readings are permutations of
+    0..28 and both "look right" against a static fake robot whose joint angles are all zero.
+
+    Under the correct reading MuJoCo slots 0-11 are the left leg then the right leg, the canonical
+    G1 ordering. Under the scatter reading slot 2 holds ``right_shoulder_pitch_joint``.
+    """
+    import numpy as np
+
+    from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+    from gear_sonic.lab_teleop.assets.g1_sonic import G1_ISAACLAB_TO_MUJOCO_MAPPING
+    from gear_sonic.lab_teleop.mdp.modal_actions import LOWER_BODY_JOINTS
+
+    mapping = np.asarray(G1_ISAACLAB_TO_MUJOCO_MAPPING["isaaclab_to_mujoco_dof"], dtype=np.int64)
+    isaac_names = np.asarray(G1_ISAACLab_ORDER, dtype=object)
+
+    mujoco_names = isaac_names[mapping]  # the gather reading
+    assert list(mujoco_names[:12]) == list(LOWER_BODY_JOINTS)
+
+    scattered = np.empty(len(isaac_names), dtype=object)
+    scattered[mapping] = isaac_names  # the scatter reading, for contrast
+    assert scattered[2] == "right_shoulder_pitch_joint"
+    assert list(scattered[:12]) != list(LOWER_BODY_JOINTS)
+
+
+def test_robot_qpos_places_each_joint_in_its_mujoco_slot() -> None:
+    """End-to-end through the real term: a distinct angle per joint must land where it belongs.
+
+    Uses a different value per joint precisely so a permutation cannot pass. The planner
+    conditions on this pose, so getting it wrong asks the graph to plan from a body the robot is
+    not in.
+    """
+    import numpy as np
+    import torch
+
+    from gear_sonic.envs.env_utils.joint_utils import G1_ISAACLab_ORDER
+    from gear_sonic.lab_teleop.assets.g1_sonic import (
+        G1_ISAACLAB_TO_MUJOCO_MAPPING,
+        G1_MODEL_12_ACTION_SCALE,
+    )
+    from gear_sonic.lab_teleop.mdp.modal_actions import (
+        SonicModalWholeBodyAction,
+        SonicModalWholeBodyActionCfg,
+    )
+    from gear_sonic.lab_teleop.tests.sonic_action_harness import FakeArticulation, FakeEnv
+
+    asset = FakeArticulation(num_envs=1, device="cpu")
+    env = FakeEnv(asset, num_envs=1, device="cpu")
+    env.step_dt = 0.02
+    term = SonicModalWholeBodyAction(
+        SonicModalWholeBodyActionCfg(
+            asset_name="robot",
+            checkpoint_dir="gear_sonic_deploy/policy/low_latency",
+            joint_names=[".*"],
+            action_scale=G1_MODEL_12_ACTION_SCALE,
+        ),
+        env,
+    )
+    angles = torch.arange(len(G1_ISAACLab_ORDER), dtype=torch.float32) * 0.01
+    asset.data.joint_pos.torch[0] = angles
+
+    qpos = term._robot_qpos()  # noqa: SLF001
+    mapping = np.asarray(G1_ISAACLAB_TO_MUJOCO_MAPPING["isaaclab_to_mujoco_dof"], dtype=np.int64)
+    for mujoco_slot, isaac_index in enumerate(mapping):
+        assert qpos[7 + mujoco_slot] == pytest.approx(float(angles[isaac_index]))
+
+    # And the leg selector must pull the legs back out of that MuJoCo-ordered pose.
+    legs = qpos[7:][term._lower_indices_mujoco]  # noqa: SLF001
+    from gear_sonic.lab_teleop.mdp.modal_actions import LOWER_BODY_JOINTS
+
+    expected = [float(angles[G1_ISAACLab_ORDER.index(n)]) for n in LOWER_BODY_JOINTS]
+    assert list(legs) == pytest.approx(expected)

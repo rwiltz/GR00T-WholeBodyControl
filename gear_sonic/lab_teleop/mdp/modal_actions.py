@@ -218,7 +218,6 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._reference_offsets = (
             np.arange(TELEOP_REFERENCE_FRAMES, dtype=np.float32) * TELEOP_REFERENCE_STRIDE_S
         )
-        self._lower_indices = np.asarray(LOWER_BODY_ISAACLAB_INDICES, dtype=np.int64)
         self._qpos_scratch = np.zeros(PLANNER_QPOS_DIM, dtype=np.float32)
         #: Rolling measured-pose history feeding the planner's context.
         #:
@@ -257,9 +256,22 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
 
         from gear_sonic.lab_teleop.assets.g1_sonic import G1_ISAACLAB_TO_MUJOCO_MAPPING
 
+        # A **gather** index: ``mujoco[i] = isaaclab[isaaclab_to_mujoco[i]]``. Reading it as a
+        # scatter silently permutes every joint -- it puts right_shoulder_pitch in MuJoCo slot 2,
+        # where left_hip_yaw belongs -- and the planner then conditions on a pose the robot is not
+        # in. Verified by resolving the mapping to names: under the gather reading MuJoCo slots
+        # 0-11 come out as the left leg then the right leg, which is the canonical G1 ordering.
         self._isaaclab_to_mujoco = np.asarray(
             G1_ISAACLAB_TO_MUJOCO_MAPPING["isaaclab_to_mujoco_dof"], dtype=np.int64
         )
+        #: MuJoCo slots of :data:`LOWER_BODY_JOINTS`, for selecting legs out of a planner pose.
+        #: The plan speaks MuJoCo order, so the Isaac Lab indices must be translated -- indexing
+        #: MuJoCo-ordered data with Isaac Lab indices is the same class of error as the one
+        #: :data:`LOWER_BODY_ISAACLAB_INDICES` documents.
+        _isaac_slot_of_mujoco = np.argsort(self._isaaclab_to_mujoco)
+        self._lower_indices_mujoco = _isaac_slot_of_mujoco[
+            np.asarray(LOWER_BODY_ISAACLAB_INDICES, dtype=np.int64)
+        ]
 
         # Anchor handling. The live XrCfg is the one held by IsaacTeleopCfg, **not** env.cfg.xr:
         # @configclass copies the latter, so mutating it moves nothing and fails silently.
@@ -503,7 +515,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._qpos_scratch[:3] = root_pos
         self._qpos_scratch[3:7] = root_quat
         # The planner speaks MuJoCo joint order; SONIC speaks Isaac Lab order.
-        self._qpos_scratch[7:][self._isaaclab_to_mujoco] = joints
+        self._qpos_scratch[7:] = joints[self._isaaclab_to_mujoco]
         return self._qpos_scratch
 
     def _track_robot_pose(self) -> None:
@@ -536,9 +548,9 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
     def _log_transition(self) -> None:
         """Trace the SMPL -> teleop handoff, so a bad transition is measurable rather than felt."""
         robot_mujoco = self._robot_qpos()
-        robot_legs = robot_mujoco[7:][self._isaaclab_to_mujoco][self._lower_indices]
+        robot_legs = robot_mujoco[7:][self._lower_indices_mujoco]
         times = self._plan_time + self._reference_offsets
-        pos, vel = self._motion.sample_joints(times, self._lower_indices)
+        pos, vel = self._motion.sample_joints(times, self._lower_indices_mujoco)
         delta = pos[0] - robot_legs
         print(
             "[SONIC] smpl -> teleop handoff\n"
@@ -617,7 +629,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         """
         obs = self._policy.encoder_obs
         times = self._plan_time + self._reference_offsets
-        pos, vel = self._motion.sample_joints(times, self._lower_indices)
+        pos, vel = self._motion.sample_joints(times, self._lower_indices_mujoco)
         obs[:, TELEOP_LOWER_POS] = torch.as_tensor(
             pos.reshape(-1), device=self.device
         ).unsqueeze(0)
