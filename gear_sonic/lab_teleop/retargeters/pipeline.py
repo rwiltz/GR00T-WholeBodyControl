@@ -110,7 +110,7 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
 
         ControllersSource -+-> TriHandMotionControllerRetargeter (x2) ------------+
                            |                                                      |
-                           +-> LocomotionRootCmdRetargeter -> SonicTeleopCommand --+
+                           +-> SonicPicoLocomotion -> SonicTeleopCommand ----------+
                                                                                   |
         FullBodySource -> SonicFullBodyRetargeter ----------------------------+---+-> TensorReorderer
 
@@ -119,9 +119,9 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
 
     Action layout, matching the action-term declaration order in ``SonicActionsCfg``::
 
-        [ sonic_reference(95) | mode(1) | locomotion_command(10) | left_hand(7) | right_hand(7) ]
+        [ sonic_reference(95) | mode(1) | locomotion_command(11) | left_hand(7) | right_hand(7) ]
 
-    == 120. Only operator-derived quantities are computed here; the velocity planner that turns
+    == 121. Only operator-derived quantities are computed here; the velocity planner that turns
     the locomotion command into a lower-body reference is closed-loop on the robot and lives in
     the action term.
 
@@ -134,8 +134,6 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
 
     def _build() -> OutputCombiner:
         from isaacteleop.retargeters import (
-            LocomotionRootCmdRetargeter,
-            LocomotionRootCmdRetargeterConfig,
             TensorReorderer,
             TriHandMotionControllerConfig,
             TriHandMotionControllerRetargeter,
@@ -145,6 +143,9 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
         from gear_sonic.lab_teleop.retargeters.sonic_command_retargeter import (
             SONIC_COMMAND_DIM,
             SonicTeleopCommandRetargeter,
+        )
+        from gear_sonic.lab_teleop.retargeters.sonic_pico_locomotion_retargeter import (
+            SonicPicoLocomotionRetargeter,
         )
 
         if vendor is None:
@@ -176,11 +177,8 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
                 .output("hand_joints")
             )
 
-        # dt matches the 50 Hz control rate; the retargeter's 1/60 default would integrate hip
-        # height ~17% fast here.
-        root_cmd = LocomotionRootCmdRetargeter(
-            LocomotionRootCmdRetargeterConfig(dt=1.0 / 50.0), name="root_command"
-        ).connect(
+        # dt matches the 50 Hz control rate, so the heading integrates in real seconds.
+        pico = SonicPicoLocomotionRetargeter(name="pico_locomotion", dt=1.0 / 50.0).connect(
             {
                 "controller_left": controllers.output(ControllersSource.LEFT),
                 "controller_right": controllers.output(ControllersSource.RIGHT),
@@ -188,7 +186,9 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
         )
         command = SonicTeleopCommandRetargeter(name="sonic_command").connect(
             {
-                "root_command": root_cmd.output("root_command"),
+                SonicPicoLocomotionRetargeter.OUTPUT_NAME: pico.output(
+                    SonicPicoLocomotionRetargeter.OUTPUT_NAME
+                ),
                 "controller_left": controllers.output(ControllersSource.LEFT),
             }
         )

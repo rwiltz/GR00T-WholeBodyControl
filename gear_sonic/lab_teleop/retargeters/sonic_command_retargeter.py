@@ -27,27 +27,16 @@ Teleop side of the boundary. The planner it feeds does not: that is closed-loop 
 measured pose and runs in the action term. See
 :mod:`gear_sonic.lab_teleop.mdp.sonic_planner`.
 
-Heading follows the deployed gamepad
-------------------------------------
-``LocomotionRootCmdRetargeter`` supplies ``vel_x``, ``vel_y``, ``rot_vel_z`` and ``hip_height``,
-and all four are used, mirroring the robot's own gamepad path
-(``gamepad_manager.hpp:751-763``)::
+Locomotion comes from the PICO port
+-----------------------------------
+Stick handling lives in :class:`SonicPicoLocomotionRetargeter`, a port of the planner loop the
+real robot runs. That matters for parity rather than tidiness: the
+same ``pico_manager_thread_server.py`` block drives the robot whether its input comes from
+XRoboToolkit or from Isaac Teleop (``get_controller_axes`` branches on ``IsaacTeleopReader``,
+:640), so porting it is what makes the sticks feel the same in both places.
 
-    facing_angle    -= 0.02 * right_stick_x       # integrated, per tick
-    moving_direction = bin45(left_stick_angle) + facing_angle
-
-so the right stick turns and the left stick drives *relative to where the robot faces*.
-
-An earlier version of this node discarded ``rot_vel_z``, arguing that integrating a turn rate
-would drift with nothing to correct against. That was wrong: drift is only meaningful against a
-ground truth, and a commanded heading has none -- it **is** the command, and the operator closes
-the loop by looking at the robot.
-
-Two sign details, both easy to get backwards. ``rot_vel_z = -right_stick_x``
-(``locomotion_retargeter.py:167``) while upstream *subtracts* ``right_stick_x``, so the negations
-cancel and this node adds. And upstream's extra ``- pi/2`` on the movement angle is **not**
-reproduced: it converts their raw ``atan2(ly, lx)``, whereas ``vel_x = +left_stick_y`` already
-puts forward at zero here.
+This node adds only what is specific to *this* environment -- the encoder mode and the floor that
+indicates it -- and passes the locomotion block through untouched.
 
 Idle handling crosses the boundary
 ----------------------------------
@@ -66,8 +55,6 @@ directions. Zero is unambiguous: a real command always carries a unit direction.
 
 from __future__ import annotations
 
-import math
-
 from isaacteleop.retargeting_engine.interface import BaseRetargeter, RetargeterIOType
 from isaacteleop.retargeting_engine.interface.retargeter_core_types import RetargeterIO
 from isaacteleop.retargeting_engine.interface.tensor_group_type import (
@@ -82,6 +69,13 @@ from isaacteleop.retargeting_engine.tensor_types import (
 )
 import numpy as np
 
+from gear_sonic.lab_teleop.retargeters.sonic_pico_locomotion_retargeter import (
+    PICO_LOCOMOTION_DIM,
+    SonicPicoLocomotionRetargeter,
+)
+
+PICO_OUTPUT = SonicPicoLocomotionRetargeter.OUTPUT_NAME
+
 __all__ = [
     "SONIC_COMMAND_DIM",
     "SONIC_ENCODER_MODE_SMPL",
@@ -94,18 +88,9 @@ __all__ = [
 SONIC_ENCODER_MODE_TELEOP = 1
 SONIC_ENCODER_MODE_SMPL = 2
 
-#: ``[mode, target_vel, movement_dir(3), facing_dir(3), height, ground_visible, turn_rate]``.
-SONIC_COMMAND_DIM = 11
-
-#: Rate the right stick sweeps the commanded heading, rad/s. Upstream applies ``0.02`` rad per
-#: tick on its 50 Hz loop (``gamepad_manager.hpp:753``); expressed as a duration here so the feel
-#: survives a change of control rate.
-TURN_RATE_RAD_S = 0.02 * 50.0
-
-#: Movement direction is quantized to eight 45 degree sectors, as upstream does
-#: (``gamepad_manager.hpp:760-763``), so the planner is driven toward cardinal and diagonal
-#: headings rather than an arbitrary stick angle.
-MOVEMENT_BIN_RAD = math.pi / 4.0
+#: ``[mode, target_vel, movement(3), facing(3), height, ground_visible, turn_rate, moving]``.
+#: Slots 1..8 are :class:`SonicPicoLocomotionRetargeter`'s block, passed through untouched.
+SONIC_COMMAND_DIM = 12
 
 
 class SonicTeleopCommandRetargeter(BaseRetargeter):
@@ -128,8 +113,6 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         name: str = "sonic_command",
         default_mode: int = SONIC_ENCODER_MODE_SMPL,
         toggle_side: str = "left",
-        dt: float = 0.02,
-        turn_rate: float = TURN_RATE_RAD_S,
     ) -> None:
         if toggle_side not in ("left", "right"):
             raise ValueError(f"toggle_side must be 'left' or 'right', got {toggle_side!r}")
@@ -138,22 +121,24 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         self._default_mode = int(default_mode)
         self._mode = int(default_mode)
         self._toggle_was_down = False
-        self._dt = float(dt)
-        self._turn_rate = float(turn_rate)
-        #: Commanded heading in radians, integrated from the right stick. Zeroed on reset so an
-        #: episode always starts pointing the way the operator does.
-        self._facing_angle = 0.0
         self._out = np.zeros(SONIC_COMMAND_DIM, dtype=np.float32)
         super().__init__(name=name)
 
     def input_spec(self) -> RetargeterIOType:
-        """The root command and the controller that toggles the mode."""
+        """The PICO locomotion block and the controller that toggles the mode."""
         controllers = {f"controller_{self._toggle_side}": OptionalType(ControllerInput())}
         return {
             **controllers,
-            "root_command": TensorGroupType(
-                "root_command",
-                [NDArrayType("command", shape=(4,), dtype=DLDataType.FLOAT, dtype_bits=32)],
+            PICO_OUTPUT: TensorGroupType(
+                PICO_OUTPUT,
+                [
+                    NDArrayType(
+                        "command",
+                        shape=(PICO_LOCOMOTION_DIM,),
+                        dtype=DLDataType.FLOAT,
+                        dtype_bits=32,
+                    )
+                ],
             ),
         }
 
@@ -180,7 +165,6 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         if context.execution_events.reset:
             self._mode = self._default_mode
             self._toggle_was_down = False
-            self._facing_angle = 0.0
 
         controller = inputs[f"controller_{self._toggle_side}"]
         if not controller.is_none:
@@ -194,32 +178,18 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
                 )
             self._toggle_was_down = down
 
-        root_command = np.asarray(
-            np.from_dlpack(inputs["root_command"][0]), dtype=np.float32
-        ).reshape(4)
-        vel_x, vel_y, rot_vel_z, hip_height = (float(v) for v in root_command)
-        speed = math.hypot(vel_x, vel_y)
-        self._facing_angle += self._turn_rate * rot_vel_z * self._dt
+        locomotion = np.asarray(
+            np.from_dlpack(inputs[PICO_OUTPUT][0]), dtype=np.float32
+        ).reshape(PICO_LOCOMOTION_DIM)
 
         self._out[:] = 0.0
         self._out[0] = float(self._mode)
-        self._out[1] = speed
-        self._out[5] = math.cos(self._facing_angle)
-        self._out[6] = math.sin(self._facing_angle)
-        if speed > 1e-4:
-            # Quantize the stick angle, then express it relative to where the robot faces.
-            stick = math.atan2(vel_y, vel_x)
-            binned = round(stick / MOVEMENT_BIN_RAD) * MOVEMENT_BIN_RAD
-            heading = binned + self._facing_angle
-            self._out[2] = math.cos(heading)
-            self._out[3] = math.sin(heading)
-        # else: leave the movement vector zero -- the action term substitutes an idle direction
-        # derived from measured robot state, which is not available here. Facing is still sent: it
-        # is a commanded heading and holds while the operator stands still.
-        self._out[8] = hip_height
+        # target_vel, movement, facing and height, exactly as the PICO loop produced them.
+        self._out[1:9] = locomotion[0:8]
         # The floor is the mode indicator: shown while walking, hidden while tracking.
         self._out[9] = 1.0 if self._mode == SONIC_ENCODER_MODE_TELEOP else 0.0
-        # Raw turn command, for the action term to swing the XR anchor in smpl mode, where there
-        # is no planner to face anywhere.
-        self._out[10] = rot_vel_z
+        # Raw turn, for the action term to swing the XR anchor in smpl mode where there is no
+        # planner to face anywhere, and the moving flag it uses to pick the idle clip.
+        self._out[10] = locomotion[8]
+        self._out[11] = locomotion[9]
         outputs[self.OUTPUT_NAME][0] = self._out
