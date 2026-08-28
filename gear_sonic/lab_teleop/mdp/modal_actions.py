@@ -56,7 +56,6 @@ from gear_sonic.lab_teleop.mdp.sonic_planner import (
 )
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,
-    VR3_POINT_SMPL_INDICES,
     SonicReferenceSlice,
 )
 from gear_sonic.lab_teleop.retargeters.sonic_pico_locomotion_retargeter import (
@@ -123,10 +122,6 @@ TELEOP_REFERENCE_FRAMES = 10
 #: duration, not a frame count, so it stays correct if the environment's control rate changes.
 TELEOP_REFERENCE_STRIDE_S = 5.0 * SONIC_REFERENCE_DT
 
-#: SMPL joint indices, into the reference's 24-joint **root-local** block, for the three points
-#: ``vr_3point`` carries. Shared with the retargeter, which uses the same three joints to build
-#: the matching orientations, so positions and orientations cannot drift apart.
-VR3_SMPL_INDICES = VR3_POINT_SMPL_INDICES
 
 #: Time constant for smoothing the followed anchor yaw, seconds.
 #:
@@ -745,27 +740,10 @@ The checkpoint's contract is that terms outside the active mode are zero -- the 
         )
         obs[:, TELEOP_ANCHOR_ORI] = anchor.reshape(1, -1)
 
-        # vr_3point positions: the operator's own wrists and head, relative to their own pelvis.
-        #
-        # No positional offsets are applied. The C++ adds +0.18 along each wrist's X and +0.35 Z
-        # on the torso only when *synthesizing* VR points from a robot skeleton; with real tracked
-        # head and hands it takes the buffered values directly, which is the case here.
-        smpl = reference[:, SonicReferenceSlice.SMPL_JOINTS].reshape(1, 24, 3)
-        # Relative to the operator's pelvis, not just rotated into its frame. The reference's SMPL
-        # block divides out the root *rotation* but keeps the translation, so joint 0 sits wherever
-        # forward kinematics put it -- 0.35 m from the origin in a typical frame. Subtracting it
-        # here is what makes these "subtract root position, then rotate by the inverse root
-        # quaternion" (``g1_deploy_onnx_ref.cpp:1157-1176``), which is also how the observation is
-        # defined in training (``observations.py:1348``). Both terms are already in the rotated
-        # frame, so the subtraction commutes with the rotation.
-        obs[:, TELEOP_VR3_POS] = (
-            smpl[:, VR3_SMPL_INDICES, :] - smpl[:, 0:1, :]
-        ).reshape(1, -1)
-
-        # vr_3point orientations, already in the anchor frame and already ordered left wrist,
-        # right wrist, head. The retargeter computes them because it is the only node that sees
-        # the raw XR joint rotations; see
-        # ``SonicFullBodyRetargeter._vr_3point_orientations`` for the frame derivation.
+        # vr_3point: measured hand and neck poses relative to the operator's root, built by the
+        # retargeter because it is the only node that sees the raw tracker poses. See
+        # ``SonicFullBodyRetargeter._vr_three_point`` -- a port of what the real robot runs.
+        obs[:, TELEOP_VR3_POS] = reference[:, SonicReferenceSlice.VR3_POS]
         obs[:, TELEOP_VR3_ORN] = reference[:, SonicReferenceSlice.VR3_ORN]
 
     def process_actions(self, actions: torch.Tensor) -> None:

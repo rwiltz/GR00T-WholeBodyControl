@@ -29,10 +29,8 @@ import torch
 sys.modules.setdefault("zmq", mock.MagicMock())
 
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (  # noqa: E402
-    _SMPL_BASE_ROT_WXYZ,
     _SMPL_PARENT_INDICES,
     SONIC_REFERENCE_DIM,
-    VR3_POINT_SMPL_INDICES,
     SonicFullBodyRetargeter,
     SonicFullBodyRetargeterConfig,
     SonicReferenceSlice,
@@ -110,7 +108,7 @@ def test_matches_upstream(retargeter: SonicFullBodyRetargeter, seed: int) -> Non
 def test_output_layout(retargeter: SonicFullBodyRetargeter) -> None:
     """The flat frame is the advertised width and flags itself valid."""
     frame = retargeter._retarget(_make_body_frame(1))  # noqa: SLF001
-    assert frame.shape == (SONIC_REFERENCE_DIM,) == (95,)
+    assert frame.shape == (SONIC_REFERENCE_DIM,) == (104,)
     assert frame.dtype == np.float32
     assert frame[SonicReferenceSlice.VALID] == pytest.approx(1.0)
 
@@ -145,46 +143,64 @@ def test_neutral_frame_before_first_good_frame() -> None:
     expected[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
     expected[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
     np.testing.assert_array_equal(frame, expected)
+    # vr_3point positions are legitimately zero here: an untracked operator has no measured hands.
+    assert not frame[SonicReferenceSlice.VR3_POS].any()
 
 
-def test_vr_3point_orientations_match_the_training_definition(
-    retargeter: SonicFullBodyRetargeter,
-) -> None:
-    """The shipped closed form equals the long way round through the FK chain.
+def test_vr_three_point_matches_the_shipped_pico_implementation() -> None:
+    """The ``vr_3point`` block must equal what the real robot computes, to float precision.
 
-    ``vr_3point_local_orn_target`` is ``quat_inv(anchor_quat_w) * point_quat_w``
-    (``gear_sonic/envs/manager_env/mdp/observations.py:1430``). Here the anchor is the retargeted
-    root after ``smpl_root_ytoz_up`` and ``remove_smpl_base_rot``, and the point rotation comes
-    from chaining the SMPL local rotations. The retargeter skips both because the chain
-    telescopes; this test rebuilds them the long way and demands the same answer.
+    Checked against ``_process_3pt_pose`` itself rather than a restatement of it. That distinction
+    earned its place here: two successive attempts at this block were derived from *reading* the
+    upstream maths -- first the wrong joints and no rotation offsets, then positions taken from
+    canonical-skeleton forward kinematics instead of the tracked positions -- and both looked
+    plausible while sitting half a metre out.
+
+    The same function is reached from Isaac Teleop as from XRoboToolkit
+    (``get_controller_axes`` branches on ``IsaacTeleopReader``), so matching it is what makes the
+    arm targets agree between this environment and hardware.
     """
-    body_poses = _make_body_frame(7)
-    actual = retargeter._retarget(body_poses)[SonicReferenceSlice.VR3_ORN].reshape(3, 4)  # noqa: SLF001
+    retargeter = SonicFullBodyRetargeter(
+        SonicFullBodyRetargeterConfig(device="cpu"), name="three_point"
+    )
+    for seed in (1, 5, 11):
+        body_poses = _make_body_frame(seed)
+        expected = upstream._process_3pt_pose(body_poses.copy())  # (3, 7) [xyz, wxyz]
+        positions, orientations = retargeter._vr_three_point(body_poses)  # noqa: SLF001
 
-    # Global XR rotations, exactly as ``_xr_to_smpl_local`` forms them.
-    globals_ = sRot.from_quat(body_poses[:, [6, 3, 4, 5]], scalar_first=True)
-    globals_ = globals_ * sRot.from_euler("y", 180, degrees=True)
-    local = [
-        globals_[i] if _SMPL_PARENT_INDICES[i] == -1
-        else globals_[_SMPL_PARENT_INDICES[i]].inv() * globals_[i]
-        for i in range(24)
-    ]
+        np.testing.assert_allclose(positions, expected[:, :3], atol=1e-5)
+        for i in range(3):
+            residual = (
+                sRot.from_quat(orientations[i], scalar_first=True).inv()
+                * sRot.from_quat(expected[i, 3:], scalar_first=True)
+            ).magnitude()
+            assert residual == pytest.approx(0.0, abs=1e-4)
 
-    # Anchor: Y-up -> Z-up left-multiplies the root; remove_smpl_base_rot right-multiplies it.
-    root_z_up = sRot.from_rotvec([np.pi / 2, 0.0, 0.0]) * local[0]
-    base = sRot.from_quat(_SMPL_BASE_ROT_WXYZ, scalar_first=True)
-    anchor = root_z_up * base.inv()
 
-    # Point rotations by walking the FK chain from that same root.
-    chain = [None] * 24
-    chain[0] = root_z_up
-    for i in range(1, 24):
-        chain[i] = chain[_SMPL_PARENT_INDICES[i]] * local[i]
+def test_vr_three_point_uses_tracked_positions_not_canonical_fk() -> None:
+    """Scaling the tracked skeleton must move the targets.
 
-    for slot, joint in enumerate(VR3_POINT_SMPL_INDICES):
-        expected = anchor.inv() * chain[joint]
-        residual = (sRot.from_quat(actual[slot], scalar_first=True).inv() * expected).magnitude()
-        assert residual == pytest.approx(0.0, abs=_TOL)
+    The ``smpl`` block deliberately discards operator proportions -- it runs forward kinematics on
+    a fixed canonical body from tracked *rotations* -- so it is invariant to this. ``vr_3point`` is
+    a measured quantity and must not be. Reading one where the other was meant is what put the
+    targets 0.44-0.87 m out on a real capture.
+    """
+    retargeter = SonicFullBodyRetargeter(
+        SonicFullBodyRetargeterConfig(device="cpu"), name="scale"
+    )
+    body_poses = _make_body_frame(3)
+    scaled = body_poses.copy()
+    scaled[:, :3] *= 1.5  # a taller operator, same posture
+
+    base, _ = retargeter._vr_three_point(body_poses)  # noqa: SLF001
+    grown, _ = retargeter._vr_three_point(scaled)  # noqa: SLF001
+    assert np.linalg.norm(grown - base) > 0.05
+
+    # The smpl joint block, by contrast, is unchanged: proportions are replaced by the canonical
+    # skeleton, so only rotations reach it.
+    ref_a = retargeter._retarget(body_poses)[SonicReferenceSlice.SMPL_JOINTS]  # noqa: SLF001
+    ref_b = retargeter._retarget(scaled)[SonicReferenceSlice.SMPL_JOINTS]  # noqa: SLF001
+    np.testing.assert_allclose(ref_a, ref_b, atol=1e-6)
 
 
 def test_pipeline_builds() -> None:
