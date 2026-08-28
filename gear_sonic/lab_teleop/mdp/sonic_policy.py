@@ -47,7 +47,10 @@ whose CUDA major version matches torch's::
 Version matters: ``onnxruntime-gpu`` 1.28 links CUDA 13 and fails to load against a
 ``torch==2.11.0+cu128`` environment (``libcublasLt.so.13: cannot open shared object file``). The
 1.22 line targets CUDA 12 / cuDNN 9 and matches. When the provider cannot load, onnxruntime falls
-back to CPU *silently*, so :class:`SonicOnnxPolicy` warns explicitly instead.
+back to CPU *silently*. :class:`SonicOnnxPolicy` treats that as fatal rather than warning: the
+symptom is an environment that merely feels slow, which is readily mistaken for the implementation
+rather than the install. Asking for CPU inference explicitly via ``policy_device='cpu'`` is still
+supported and does not raise.
 
 This module imports ``torch`` at module scope on purpose: doing so loads torch's bundled CUDA
 libraries into the process, which is what lets onnxruntime's CUDA provider resolve
@@ -394,16 +397,46 @@ class SonicOnnxPolicy:
 
         self._gpu_resident = self._is_cuda and "CUDAExecutionProvider" in self.providers
         if self._is_cuda and not self._gpu_resident:
-            import warnings
-
-            warnings.warn(
-                "SONIC ONNX is running on CPU while the simulation is on CUDA. The decoder is "
-                "~37M params and costs ~17 ms per step there, against a 20 ms control period at "
-                "50 Hz. Falling back to the host round-trip path. Install the GPU runtime for "
-                "real-time teleoperation:\n"
-                "    uv pip install --python <isaaclab-venv>/bin/python onnxruntime-gpu",
-                RuntimeWarning,
-                stacklevel=2,
+            installed = sorted(ort.get_available_providers())
+            runtime_has_cuda = "CUDAExecutionProvider" in installed
+            if runtime_has_cuda:
+                # The runtime could do it; this session was told not to. Naming the wheel here
+                # would send the reader to reinstall something that is already correct.
+                cause = (
+                    "  cause    : this session's provider list excludes it, though the runtime "
+                    "supports it.\n"
+                    "  fix      : drop the explicit providers= argument, or include "
+                    "'CUDAExecutionProvider'.\n"
+                )
+            else:
+                cause = (
+                    "  cause    : the CPU-only 'onnxruntime' wheel shadows 'onnxruntime-gpu' -- "
+                    "both install the same module, so whichever landed last wins.\n"
+                    "  fix      : uv pip uninstall --python <venv>/bin/python onnxruntime\n"
+                    "             uv pip install --python <venv>/bin/python "
+                    "onnxruntime-gpu==1.22.0\n"
+                    "\n"
+                    "Match the CUDA major version of your torch build: the 1.22 line targets CUDA "
+                    "12 and pairs with torch cu12x; 1.27+ links CUDA 13 and fails to load against "
+                    "it.\n"
+                )
+            raise RuntimeError(
+                "SONIC's ONNX runtime cannot use the GPU, and this is a configuration problem "
+                "rather than a limitation of the environment.\n"
+                f"  expected : CUDAExecutionProvider, because the policy resolved to "
+                f"{self.device}\n"
+                f"  session  : {', '.join(self.providers)}\n"
+                f"  installed: onnxruntime {ort.__version__} offers "
+                f"[{', '.join(installed)}]\n"
+                f"{cause}"
+                "\n"
+                "This is fatal rather than a warning because the fallback is silent and slow: the "
+                "decoder is ~37M parameters and costs ~17 ms per step on CPU against a 20 ms "
+                "control period at 50 Hz, so teleoperation misses real time and the cause is easy "
+                "to mistake for the implementation being slow.\n"
+                "\n"
+                "To run inference on the CPU deliberately, set policy_device='cpu' on the action "
+                "config; that path is supported and does not raise."
             )
 
         self._init_buffers()
