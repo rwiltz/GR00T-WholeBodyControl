@@ -28,15 +28,19 @@ The low-latency checkpoint trails you by ~80 ms instead of ~200 ms. Fetch it wit
 
 | input | action |
 |---|---|
-| **left** primary click | switch mode: tracking ⇄ walking |
-| **right** primary click | show/hide the ground plane |
+| **left** A/X (primary click) | switch mode: tracking ⇄ walking |
+| **right** A (primary click) | start / stop teleoperation |
+| **right** B (secondary click) | reset the episode |
 | trigger | pinch — index and thumb |
 | squeeze | grasp — middle and thumb |
 | left stick | **tracking mode**: slide yourself across the floor<br>**walking mode**: walk the robot |
 | right stick, up/down | walking mode: raise/lower the robot's hips |
-| `B` / `P` / `R` (keyboard) | start-resume / pause / reset |
 
-Both toggles are clicks because trigger and squeeze drive the hands.
+Everything is on the face buttons because trigger and squeeze drive the hands. The left hand owns
+the robot's mode; the right hand owns the session. No keyboard is needed.
+
+**The floor tells you which mode you are in** — visible in walking mode, hidden in tracking mode.
+It is not a separate control.
 
 ## The two modes
 
@@ -54,6 +58,8 @@ Watch the console; it prints only on change:
 ```
 [SONIC] mode smpl -> teleop
 [SONIC] ground plane shown
+[SONIC] teleop started (right A)
+[SONIC] reset (right B)
 [SONIC] reset: XR anchor restored to (0.0, 0.0, -0.19)
 ```
 

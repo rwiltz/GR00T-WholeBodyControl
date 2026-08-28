@@ -241,6 +241,13 @@ class SonicTeleopG1EnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
 
     def __post_init__(self) -> None:
+        # The right controller drives the session: A starts/stops, B resets. Installed here rather
+        # than configured because Isaac Lab does not expose Isaac Teleop's control-pipeline hook;
+        # see gear_sonic.lab_teleop.session_buttons for why a wrapper is the least invasive option.
+        from gear_sonic.lab_teleop.session_buttons import install_session_button_control
+
+        install_session_button_control()
+
         # 200 Hz physics / 50 Hz control == SONIC's control_dt_ of 0.02.
         self.decimation = 4
         self.sim.dt = 1.0 / 200.0
