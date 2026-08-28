@@ -7,7 +7,7 @@
 Extends :class:`~gear_sonic.lab_teleop.mdp.actions.SonicWholeBodyAction` with the operator's
 encoder-mode selection, mirroring the real robot's teleop stack. The environment action becomes::
 
-    [ sonic_reference(95) | mode(1) | locomotion_command(8) | ground_visible(1) ]   -> 105
+    [ sonic_reference(95) | mode(1) | locomotion_command(8) | ground(1) | turn(1) ]  -> 106
 
 ``mode`` selects which encoder observation block is populated. SONIC's encoder is mode-exclusive:
 terms outside the active mode stay zero, and the mode id plus its one-hot occupy slots ``[0]`` and
@@ -53,6 +53,7 @@ from gear_sonic.lab_teleop.mdp.sonic_planner import (
     PlannerMotion,
     SonicVelocityPlanner,
 )
+from gear_sonic.lab_teleop.retargeters.sonic_command_retargeter import TURN_RATE_RAD_S
 from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
     SONIC_REFERENCE_DIM,
     VR3_POINT_SMPL_INDICES,
@@ -65,8 +66,8 @@ __all__ = [
     "SonicModalWholeBodyActionCfg",
 ]
 
-#: ``[reference(95) | mode(1) | planner_command(8) | ground_visible(1)]``.
-SONIC_MODAL_ACTION_DIM = SONIC_REFERENCE_DIM + 1 + SONIC_PLANNER_COMMAND_DIM + 1
+#: ``[reference(95) | mode(1) | planner_command(8) | ground_visible(1) | turn_rate(1)]``.
+SONIC_MODAL_ACTION_DIM = SONIC_REFERENCE_DIM + 1 + SONIC_PLANNER_COMMAND_DIM + 2
 
 #: Prim path of the scene's ground plane, toggled from the controller.
 GROUND_PLANE_PRIM_PATH = "/World/GroundPlane"
@@ -206,6 +207,11 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         #: Trajectory currently being played, and how far into it we are. The plan is addressed
         #: by *time*, not by frame index: it is generated at 30 Hz, resampled to SONIC's 50 Hz
         #: reference clock, and consumed at whatever the environment's control rate is.
+        #: Raw right-stick turn command for this step. Drives the planner's heading in teleop
+        #: mode (integrated upstream in the retargeter) and swings the XR anchor in smpl mode,
+        #: where there is no planner to face anywhere.
+        self._turn_command = 0.0
+        self._anchor_pan_yaw = 0.0
         self._motion: PlannerMotion | None = None
         self._plan_time = 0.0
         self._since_replan = 0.0
@@ -321,6 +327,8 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._plan_time = 0.0
         self._since_replan = 0.0
         self._last_command = None
+        self._turn_command = 0.0
+        self._anchor_pan_yaw = 0.0
         self._ground_visible = None
 
     def _build_planner(self) -> SonicVelocityPlanner:
@@ -454,14 +462,27 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         Height and rotation are untouched: this is a translation on the ground plane, so the
         operator's sense of up and of facing are preserved.
         """
+        dt = self._control_dt
+
+        # Right stick: swing the operator's viewpoint. In teleop mode this same stick turns the
+        # robot, so keeping it as "turn" here means the control does one thing in the operator's
+        # head regardless of mode -- the difference is only whether there is a robot to point.
+        if abs(self._turn_command) > 1e-4:
+            self._anchor_pan_yaw += TURN_RATE_RAD_S * self._turn_command * dt
+            half = 0.5 * self._anchor_pan_yaw
+            # XrCfg.anchor_rot is XYZW, not WXYZ (xr_anchor_manager.py:110).
+            self._xr_cfg.anchor_rot = (0.0, 0.0, float(np.sin(half)), float(np.cos(half)))
+
         speed = self.cfg.anchor_pan_speed
         if speed <= 0.0 or self._pan_command is None:
             return
         target_vel = float(self._pan_command[0])
         if target_vel <= 1e-4:
             return
-        direction = self._pan_command[1:4]
-        dt = self._control_dt
+        # Slide along the operator's own facing, so "forward" stays forward after turning.
+        cos_y, sin_y = np.cos(self._anchor_pan_yaw), np.sin(self._anchor_pan_yaw)
+        dx, dy = float(self._pan_command[1]), float(self._pan_command[2])
+        direction = (cos_y * dx - sin_y * dy, sin_y * dx + cos_y * dy)
         step = target_vel * speed * dt
         pos = self._xr_cfg.anchor_pos
         self._xr_cfg.anchor_pos = (
@@ -755,6 +776,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         tail = actions[0, SONIC_REFERENCE_DIM + 1 :].detach().float().cpu().numpy()
         command = tail[:SONIC_PLANNER_COMMAND_DIM]
         ground_visible = bool(tail[SONIC_PLANNER_COMMAND_DIM] > 0.5)
+        self._turn_command = float(tail[SONIC_PLANNER_COMMAND_DIM + 1])
         self._mode = mode if mode in (ENCODER_MODE_TELEOP, ENCODER_MODE_SMPL) else ENCODER_MODE_SMPL
         if self._mode != self._prev_mode:
             print(

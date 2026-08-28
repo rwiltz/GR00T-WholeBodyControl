@@ -10,9 +10,13 @@ Everything is on the controllers. No keyboard.
 | **trigger** | pinch — index and thumb |
 | **squeeze** | grasp — middle and thumb |
 | **left stick** | tracking: slide yourself across the floor · walking: walk the robot |
+| **right stick** ←→ | turn — the robot when walking, you when tracking |
 | **right stick** ↑↓ | walking: raise / lower the hips |
 
 **The floor tells you the mode.** Visible = walking. Hidden = tracking.
+
+The left stick drives *relative to where the robot faces*, in eight 45° directions — so turn first,
+then walk, exactly as on the real robot's gamepad.
 
 Left hand drives the robot, right hand drives the session. Face buttons only, because
 trigger and squeeze are the hands.

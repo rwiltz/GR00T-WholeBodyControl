@@ -119,9 +119,9 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
 
     Action layout, matching the action-term declaration order in ``SonicActionsCfg``::
 
-        [ sonic_reference(95) | mode(1) | locomotion_command(8) | left_hand(7) | right_hand(7) ]
+        [ sonic_reference(95) | mode(1) | locomotion_command(10) | left_hand(7) | right_hand(7) ]
 
-    == 119. Only operator-derived quantities are computed here; the velocity planner that turns
+    == 120. Only operator-derived quantities are computed here; the velocity planner that turns
     the locomotion command into a lower-body reference is closed-loop on the robot and lives in
     the action term.
 
@@ -190,7 +190,6 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
             {
                 "root_command": root_cmd.output("root_command"),
                 "controller_left": controllers.output(ControllersSource.LEFT),
-                "sonic_reference": reference.output("sonic_reference"),
             }
         )
 

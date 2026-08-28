@@ -27,14 +27,27 @@ Teleop side of the boundary. The planner it feeds does not: that is closed-loop 
 measured pose and runs in the action term. See
 :mod:`gear_sonic.lab_teleop.mdp.sonic_planner`.
 
-What is deliberately *not* reused
----------------------------------
-``LocomotionRootCmdRetargeter`` supplies ``vel_x``, ``vel_y`` and ``hip_height`` directly. Its
-``rot_vel_z`` is **not** used: the planner wants an absolute ``facing_direction`` vector, and
-integrating a turn rate into a heading would drift with no reference to correct against. The
-reference implementation instead takes facing from an absolute source -- the operator's view
-direction (``motionbricks/.../demo/controllers.py:196-207``) -- which is what this node does using
-the operator's own root yaw.
+Heading follows the deployed gamepad
+------------------------------------
+``LocomotionRootCmdRetargeter`` supplies ``vel_x``, ``vel_y``, ``rot_vel_z`` and ``hip_height``,
+and all four are used, mirroring the robot's own gamepad path
+(``gamepad_manager.hpp:751-763``)::
+
+    facing_angle    -= 0.02 * right_stick_x       # integrated, per tick
+    moving_direction = bin45(left_stick_angle) + facing_angle
+
+so the right stick turns and the left stick drives *relative to where the robot faces*.
+
+An earlier version of this node discarded ``rot_vel_z``, arguing that integrating a turn rate
+would drift with nothing to correct against. That was wrong: drift is only meaningful against a
+ground truth, and a commanded heading has none -- it **is** the command, and the operator closes
+the loop by looking at the robot.
+
+Two sign details, both easy to get backwards. ``rot_vel_z = -right_stick_x``
+(``locomotion_retargeter.py:167``) while upstream *subtracts* ``right_stick_x``, so the negations
+cancel and this node adds. And upstream's extra ``- pi/2`` on the movement angle is **not**
+reproduced: it converts their raw ``atan2(ly, lx)``, whereas ``vel_x = +left_stick_y`` already
+puts forward at zero here.
 
 Idle handling crosses the boundary
 ----------------------------------
@@ -69,11 +82,6 @@ from isaacteleop.retargeting_engine.tensor_types import (
 )
 import numpy as np
 
-from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
-    SONIC_REFERENCE_DIM,
-    SonicReferenceSlice,
-)
-
 __all__ = [
     "SONIC_COMMAND_DIM",
     "SONIC_ENCODER_MODE_SMPL",
@@ -86,8 +94,18 @@ __all__ = [
 SONIC_ENCODER_MODE_TELEOP = 1
 SONIC_ENCODER_MODE_SMPL = 2
 
-#: ``[mode, target_vel, movement_dir(3), facing_dir(3), height, ground_visible]``.
-SONIC_COMMAND_DIM = 10
+#: ``[mode, target_vel, movement_dir(3), facing_dir(3), height, ground_visible, turn_rate]``.
+SONIC_COMMAND_DIM = 11
+
+#: Rate the right stick sweeps the commanded heading, rad/s. Upstream applies ``0.02`` rad per
+#: tick on its 50 Hz loop (``gamepad_manager.hpp:753``); expressed as a duration here so the feel
+#: survives a change of control rate.
+TURN_RATE_RAD_S = 0.02 * 50.0
+
+#: Movement direction is quantized to eight 45 degree sectors, as upstream does
+#: (``gamepad_manager.hpp:760-763``), so the planner is driven toward cardinal and diagonal
+#: headings rather than an arbitrary stick angle.
+MOVEMENT_BIN_RAD = math.pi / 4.0
 
 
 class SonicTeleopCommandRetargeter(BaseRetargeter):
@@ -110,6 +128,8 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         name: str = "sonic_command",
         default_mode: int = SONIC_ENCODER_MODE_SMPL,
         toggle_side: str = "left",
+        dt: float = 0.02,
+        turn_rate: float = TURN_RATE_RAD_S,
     ) -> None:
         if toggle_side not in ("left", "right"):
             raise ValueError(f"toggle_side must be 'left' or 'right', got {toggle_side!r}")
@@ -118,28 +138,22 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         self._default_mode = int(default_mode)
         self._mode = int(default_mode)
         self._toggle_was_down = False
+        self._dt = float(dt)
+        self._turn_rate = float(turn_rate)
+        #: Commanded heading in radians, integrated from the right stick. Zeroed on reset so an
+        #: episode always starts pointing the way the operator does.
+        self._facing_angle = 0.0
         self._out = np.zeros(SONIC_COMMAND_DIM, dtype=np.float32)
         super().__init__(name=name)
 
     def input_spec(self) -> RetargeterIOType:
-        """Root command, the toggling controller, and the operator's own reference frame."""
+        """The root command and the controller that toggles the mode."""
         controllers = {f"controller_{self._toggle_side}": OptionalType(ControllerInput())}
         return {
             **controllers,
             "root_command": TensorGroupType(
                 "root_command",
                 [NDArrayType("command", shape=(4,), dtype=DLDataType.FLOAT, dtype_bits=32)],
-            ),
-            "sonic_reference": TensorGroupType(
-                "sonic_reference",
-                [
-                    NDArrayType(
-                        "reference",
-                        shape=(SONIC_REFERENCE_DIM,),
-                        dtype=DLDataType.FLOAT,
-                        dtype_bits=32,
-                    )
-                ],
             ),
         }
 
@@ -159,23 +173,6 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
             )
         }
 
-    @staticmethod
-    def _operator_yaw(reference: np.ndarray) -> float:
-        """Yaw of the operator's root orientation, in the reference's own frame.
-
-        Args:
-            reference: ``(95,)`` SONIC reference frame.
-
-        Returns:
-            Yaw in radians. Zero when the frame is not marked valid, so an untracked operator
-            commands a fixed heading rather than a wildly varying one.
-        """
-        if reference[SonicReferenceSlice.VALID][0] <= 0.5:
-            return 0.0
-        w, x, y, z = (float(v) for v in reference[SonicReferenceSlice.ROOT_QUAT])
-        # Standard yaw extraction for a wxyz quaternion.
-        return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
     def _compute_fn(
         self, inputs: RetargeterIO, outputs: RetargeterIO, context
     ) -> None:  # noqa: ANN001
@@ -183,6 +180,7 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         if context.execution_events.reset:
             self._mode = self._default_mode
             self._toggle_was_down = False
+            self._facing_angle = 0.0
 
         controller = inputs[f"controller_{self._toggle_side}"]
         if not controller.is_none:
@@ -199,28 +197,29 @@ class SonicTeleopCommandRetargeter(BaseRetargeter):
         root_command = np.asarray(
             np.from_dlpack(inputs["root_command"][0]), dtype=np.float32
         ).reshape(4)
-        reference = np.asarray(
-            np.from_dlpack(inputs["sonic_reference"][0]), dtype=np.float32
-        ).reshape(SONIC_REFERENCE_DIM)
-
-        vel_x, vel_y, _rot_vel_z, hip_height = (float(v) for v in root_command)
+        vel_x, vel_y, rot_vel_z, hip_height = (float(v) for v in root_command)
         speed = math.hypot(vel_x, vel_y)
-        yaw = self._operator_yaw(reference)
+        self._facing_angle += self._turn_rate * rot_vel_z * self._dt
 
         self._out[:] = 0.0
         self._out[0] = float(self._mode)
         self._out[1] = speed
+        self._out[5] = math.cos(self._facing_angle)
+        self._out[6] = math.sin(self._facing_angle)
         if speed > 1e-4:
-            # Stick direction is relative to the operator; rotate it into the shared frame, as
-            # ``abs_heading_angle = view_angle + relative_angle`` does upstream.
-            heading = yaw + math.atan2(vel_y, vel_x)
+            # Quantize the stick angle, then express it relative to where the robot faces.
+            stick = math.atan2(vel_y, vel_x)
+            binned = round(stick / MOVEMENT_BIN_RAD) * MOVEMENT_BIN_RAD
+            heading = binned + self._facing_angle
             self._out[2] = math.cos(heading)
             self._out[3] = math.sin(heading)
-            self._out[5] = math.cos(yaw)
-            self._out[6] = math.sin(yaw)
-        # else: leave both direction vectors zero -- the action term substitutes idle directions
-        # derived from measured robot state, which is not available here.
+        # else: leave the movement vector zero -- the action term substitutes an idle direction
+        # derived from measured robot state, which is not available here. Facing is still sent: it
+        # is a commanded heading and holds while the operator stands still.
         self._out[8] = hip_height
         # The floor is the mode indicator: shown while walking, hidden while tracking.
         self._out[9] = 1.0 if self._mode == SONIC_ENCODER_MODE_TELEOP else 0.0
+        # Raw turn command, for the action term to swing the XR anchor in smpl mode, where there
+        # is no planner to face anywhere.
+        self._out[10] = rot_vel_z
         outputs[self.OUTPUT_NAME][0] = self._out
