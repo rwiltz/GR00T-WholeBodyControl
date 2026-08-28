@@ -11,15 +11,18 @@ python -m gear_sonic.lab_teleop.scripts.run teleop \
     --viz kit --xr --device cuda:0
 ```
 
-Connect the headset once the console prints `CloudXR runtime auto-launched`. Four tasks exist;
-they differ only by SONIC checkpoint and by live-versus-replay:
+Connect the headset once the console prints `CloudXR runtime auto-launched`. Six tasks exist,
+differing only by SONIC checkpoint, live-versus-replay, and whether the props are present. All are
+prefixed `IsaacContrib-Teleop-Sonic-WholeBody`:
 
 | task id | |
 |---|---|
-| `IsaacContrib-Teleop-Sonic-WholeBody-G1-v0` | live, SONIC v1.1 |
-| `IsaacContrib-Teleop-Sonic-WholeBody-G1-Replay-v0` | MCAP replay, v1.1 |
-| `IsaacContrib-Teleop-Sonic-WholeBody-G1-LowLatency-v0` | live, low-latency checkpoint |
-| `IsaacContrib-Teleop-Sonic-WholeBody-G1-LowLatency-Replay-v0` | MCAP replay, low-latency |
+| `-G1-v0` | live, SONIC v1.1 |
+| `-G1-Replay-v0` | MCAP replay, v1.1 |
+| `-G1-LowLatency-v0` | live, low-latency checkpoint |
+| `-G1-LowLatency-Replay-v0` | MCAP replay, low-latency |
+| `-G1-LowLatency-Bare-v0` | live, low-latency, no props |
+| `-G1-LowLatency-Bare-Replay-v0` | MCAP replay, low-latency, no props |
 
 The low-latency checkpoint trails you by ~80 ms instead of ~200 ms. Fetch it with
 `python download_from_hf.py --low-latency`.

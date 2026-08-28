@@ -677,12 +677,11 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
     def _clear_teleop_slots(self) -> None:
         """Zero the ``teleop`` blocks when the encoder returns to ``smpl`` mode.
 
-        The checkpoint's contract is that terms outside the active mode are zero -- the deploy
-        stack sends them as zeros rather than omitting them. The encoder observation is a single
-        persistent buffer, and ``fill_smpl_encoder_obs`` only rewrites the ``smpl`` blocks on the
-        assumption that everything else "stays zero for the process lifetime". That assumption
-        predates mode switching: without this, every ``smpl`` frame after a walking excursion
-        carries the last planner window and anchor orientation into the encoder.
+The checkpoint's contract is that terms outside the active mode are zero -- the deploy stack
+        sends them as zeros rather than omitting them. The encoder observation is a single
+        persistent buffer and ``fill_smpl_encoder_obs`` rewrites only the ``smpl`` blocks, so
+        without this every ``smpl`` frame after a walking excursion would carry the last planner
+        window and anchor orientation into the encoder.
 
         Called on the transition rather than every step: nothing writes these slots while
         ``smpl`` mode is active, so one pass is enough.
@@ -701,11 +700,9 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         """Write the encoder's 0.9 s look-ahead window of planned leg motion.
 
         Two contiguous frame-major blocks -- all ten frames of positions, then all ten of
-        velocities -- sampled at ``current plan time + i * 0.1 s``. This is a window into the
-        *future* of the plan, which is what ``10frame_step5`` means
-        (``observation_config.md:96-99``); the previous implementation supplied a trailing history
-        of poses the robot had already been through, at the wrong spacing, with positions and
-        velocities interleaved into each other's slots.
+        velocities -- sampled at ``current plan time + i * 0.1 s``. ``10frame_step5`` names a
+        window into the plan's *future*: ten samples 0.1 s apart on the checkpoint's own 50 Hz
+        clock, spanning 0.9 s ahead (``observation_config.md:96-99``).
         """
         obs = self._policy.encoder_obs
         times = self._plan_time + self._reference_offsets

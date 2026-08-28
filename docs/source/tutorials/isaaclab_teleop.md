@@ -22,15 +22,19 @@ not run them simultaneously.
 
 ```
 Isaac Teleop (FullBodySource, 24-joint XR_BD_body_tracking)
-  └─ SonicFullBodyRetargeter        XR joint rotations -> SONIC smpl reference (83 floats)
-       └─ env.step(action)          standard gym contract
-            └─ SonicWholeBodyAction encoder -> 64-dim token -> decoder -> 29 raw actions
+  ├─ SonicFullBodyRetargeter        XR joint rotations -> SONIC reference (95 floats)
+  ├─ SonicPicoLocomotion            thumbsticks -> planner command, the robot's own semantics
+  └─ TriHandMotionController (x2)   trigger/squeeze -> finger joints
+       └─ env.step(action)          standard gym contract, 121 floats
+            └─ SonicModalWholeBodyAction
+                 encoder -> 64-dim token -> decoder -> 29 raw actions
                  └─ apply_actions   raw * scale + default_joint_pos -> G1 joint targets
 ```
 
-SONIC's `smpl` encoder (`mode_id 2`) is the mode being driven. It is the only mode in which the
-operator's legs drive the robot's legs; the `teleop` mode is upper-body-only and delegates the
-lower body to a kinematic planner.
+Both of SONIC's operator modes are driven, switched from the left controller. In `smpl`
+(`mode_id 2`) the operator's legs drive the robot's legs. In `teleop` (`mode_id 1`) the upper body
+still tracks while a kinematic planner supplies the lower body, so the sticks walk the robot; that
+planner runs inside the action term, closed-loop on measured robot state.
 
 ## Prerequisites
 
@@ -90,7 +94,9 @@ lower body to a kinematic planner.
 
    Getting this wrong is quiet rather than loud. `onnxruntime-gpu` 1.28 against a `cu12` torch fails
    with `libcublasLt.so.13: cannot open shared object file`, and onnxruntime then falls back to CPU
-   **silently** — where the SONIC decoder costs ~17 ms against a 20 ms control period. Verify with
+   **silently** — where the SONIC decoder costs ~17 ms against a 20 ms control period. The action
+   term refuses to start in that state rather than running slowly without saying so, and the error
+   names the uninstall/install pair that fixes it. Verify ahead of time with
    `check_environment.py --lab-teleop` (below) rather than inferring from frame rate.
 
 4. **SONIC checkpoints**:
@@ -112,13 +118,21 @@ provider actually loads.
 
 ## Tasks
 
-| Task id | Input |
-|---|---|
-| `IsaacContrib-Teleop-Sonic-WholeBody-G1-v0` | live XR headset |
-| `IsaacContrib-Teleop-Sonic-WholeBody-G1-Replay-v0` | recorded MCAP |
+Six ids, all prefixed `IsaacContrib-Teleop-Sonic-WholeBody`:
 
-Two ids exist because `TeleopSession` rejects source nodes carrying a tracker vendor when the
-session mode is `SessionMode.REPLAY`. The replay task therefore uses a vendor-less pipeline.
+| Task id | Checkpoint | Input | Props |
+|---|---|---|---|
+| `-G1-v0` | v1.1 | live XR headset | yes |
+| `-G1-Replay-v0` | v1.1 | recorded MCAP | yes |
+| `-G1-LowLatency-v0` | low-latency | live XR headset | yes |
+| `-G1-LowLatency-Replay-v0` | low-latency | recorded MCAP | yes |
+| `-G1-LowLatency-Bare-v0` | low-latency | live XR headset | no |
+| `-G1-LowLatency-Bare-Replay-v0` | low-latency | recorded MCAP | no |
+
+Live and replay are separate ids because `TeleopSession` rejects source nodes carrying a tracker
+vendor when the session mode is `SessionMode.REPLAY`, so the replay tasks use a vendor-less
+pipeline. `Bare` drops the packing table and its crates. The low-latency checkpoint trails the
+operator by ~80 ms against v1.1's ~200 ms.
 
 ## Running
 
@@ -190,7 +204,7 @@ Measured on a Threadripper 7960X / RTX PRO 6000, single environment:
 | | rate |
 |---|---|
 | SONIC encoder + decoder (CUDA) | 0.74 ms |
-| SONIC encoder + decoder (CPU) | 17.4 ms |
+| SONIC encoder + decoder (CPU) | 17.4 ms — fatal, see above |
 | Environment, headless | ~66 Hz |
 | Environment, `--viz kit` | ~33 Hz |
 

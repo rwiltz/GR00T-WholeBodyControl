@@ -541,9 +541,9 @@ class SonicWholeBodyAction(ActionTerm):
 
         The delta is computed every step and written only where an environment has a valid
         reference and has not latched yet. Computing unconditionally trades a few small kernels
-        for the device synchronize that the previous ``if bool(to_latch.any())`` guard cost on
-        every control step. Values from environments that should not latch are discarded by the
-        select, so a degenerate quaternion on an invalid frame cannot leak in.
+        for the device synchronize an ``if bool(to_latch.any())`` guard would cost every control
+        step. Values from environments that should not latch are discarded by the select, so a
+        degenerate quaternion on an invalid frame cannot leak in.
         """
         from gear_sonic.isaac_utils.rotations import (
             calc_heading_quat,

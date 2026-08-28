@@ -30,10 +30,9 @@ measured pose and runs in the action term. See
 Locomotion comes from the PICO port
 -----------------------------------
 Stick handling lives in :class:`SonicPicoLocomotionRetargeter`, a port of the planner loop the
-real robot runs. That matters for parity rather than tidiness: the
-same ``pico_manager_thread_server.py`` block drives the robot whether its input comes from
-XRoboToolkit or from Isaac Teleop (``get_controller_axes`` branches on ``IsaacTeleopReader``,
-:640), so porting it is what makes the sticks feel the same in both places.
+real robot runs -- the same ``pico_manager_thread_server.py`` block drives the robot whether its
+input arrives from XRoboToolkit or from Isaac Teleop (``get_controller_axes`` branches on
+``IsaacTeleopReader``, :640), so the sticks feel the same in both places.
 
 This node adds only what is specific to *this* environment -- the encoder mode and the floor that
 indicates it -- and passes the locomotion block through untouched.

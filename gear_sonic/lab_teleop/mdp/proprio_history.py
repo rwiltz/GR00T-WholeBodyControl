@@ -42,20 +42,17 @@ write position, so reading needs neither a gather nor an index-dependent two-pie
                  ^-------------^
                  window [2:6] = b c d a   -> oldest .. newest
 
-The previous implementation instead called ``torch.roll`` on every term every tick, which
-allocates a full copy of each buffer and rewrites all H frames to advance by one. The mirrored ring
-writes 2 frames and advances an integer.
-
-The doubling costs 930 extra floats per environment, which is negligible next to avoiding five
-per-tick buffer copies.
+Advancing therefore writes 2 frames and increments an integer, where ``torch.roll`` would
+allocate a full copy of each term and rewrite all H frames every tick. The doubled buffer costs
+930 extra floats per environment, negligible against five per-tick copies avoided.
 
 Backfill without synchronizing
 ------------------------------
-The previous implementation guarded the backfill with ``if bool(unprimed.any())``, reading a CUDA
-tensor from Python and thereby forcing a device synchronize on *every* control step purely to
-discover that -- in steady state -- there was nothing to backfill.
+Guarding the backfill with ``if bool(unprimed.any())`` would read a CUDA tensor from Python and
+force a device synchronize on *every* control step, purely to discover that -- in steady state --
+there is nothing to backfill.
 
-The replacement splits the question in two. *Whether* any backfill is pending depends only on
+The question is therefore split in two. *Whether* any backfill is pending depends only on
 whether :meth:`SonicProprioHistory.reset` has been called since the last append, which the host
 already witnessed; that is tracked in a plain Python bool, so steady state skips the work entirely
 without consulting the device. *Which* environments need it is a per-env mask, applied with

@@ -394,9 +394,8 @@ class SonicVelocityPlanner:
     def plan(self, command: np.ndarray, mode: int = PLANNER_CLIP_WALK) -> PlannerMotion:
         """Run the graph once and return the whole planned trajectory.
 
-        Returns a trajectory rather than a frame on purpose. The previous ``next_frame`` API handed
-        back one native 30 Hz frame per call, and the caller advanced it once per 50 Hz control
-        step -- playing every plan at 1.67x.
+        Returns the whole trajectory rather than a frame, so a caller cannot advance a native
+        30 Hz plan once per 50 Hz control step and play it at 1.67x.
 
         Args:
             command: ``(8,)`` ``[target_vel, movement_dir(3), facing_dir(3), height]``.
