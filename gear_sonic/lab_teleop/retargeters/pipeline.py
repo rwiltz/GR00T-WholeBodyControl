@@ -121,7 +121,7 @@ def make_sonic_full_pipeline_builder(vendor: str | None = DEFAULT_BODY_TRACKER_V
 
         [ sonic_reference(95) | mode(1) | locomotion_command(8) | left_hand(7) | right_hand(7) ]
 
-    == 106. Only operator-derived quantities are computed here; the velocity planner that turns
+    == 119. Only operator-derived quantities are computed here; the velocity planner that turns
     the locomotion command into a lower-body reference is closed-loop on the robot and lives in
     the action term.
 

@@ -45,7 +45,6 @@ from gear_sonic.lab_teleop.mdp.actions import SonicWholeBodyAction, SonicWholeBo
 from gear_sonic.lab_teleop.mdp.sonic_planner import (
     PLANNER_CLIP_WALK,
     PLANNER_CONTEXT_FRAMES,
-    PLANNER_IDLE_COMMAND,
     PLANNER_LOOKAHEAD_S,
     PLANNER_PERIODIC_REPLAN_S,
     PLANNER_QPOS_DIM,
@@ -146,8 +145,6 @@ class SonicModalWholeBodyActionCfg(SonicWholeBodyActionCfg):
     planner_clip: int = PLANNER_CLIP_WALK
     """Planner gait/style clip. **Not** the SONIC encoder mode; clip 0 is idle and ignores speed."""
 
-    planner_replan_interval: int = 0
-
     #: Print a one-off trace of the SMPL -> teleop handoff: the discontinuity between the robot's
     #: measured legs and the first planned pose, the planned velocity scale, and every clock in
     #: play. Off by default -- this is a diagnostic for the transition, not routine logging.
@@ -206,8 +203,6 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
 
         lower_ids, _ = self._asset.find_joints(list(LOWER_BODY_JOINTS), preserve_order=True)
         self._lower_body_ids = torch.as_tensor(lower_ids, device=self.device)
-        #: Rolling window of planned lower-body pos+vel, oldest first, mirroring the encoder's
-        #: expectation of a 10-frame history.
         #: Trajectory currently being played, and how far into it we are. The plan is addressed
         #: by *time*, not by frame index: it is generated at 30 Hz, resampled to SONIC's 50 Hz
         #: reference clock, and consumed at whatever the environment's control rate is.
@@ -542,11 +537,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         self._motion = planner.initialize_from_robot(joints_mujoco)
         self._plan_time = 0.0
         self._since_replan = 0.0
-        # Record the command the idle plan was generated from, so the very next control step does
-        # not immediately replan it away. Leaving this None made `_replan_needed` fire at once and
-        # the idle trajectory was replaced before it played a single frame -- the initialization
-        # was real but invisible.
-        self._last_command = PLANNER_IDLE_COMMAND.copy()
+        self._last_command = None
         if self.cfg.debug_transitions:
             self._log_transition()
 
@@ -571,6 +562,29 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             flush=True,
         )
 
+    def _canonical_command(self, command: np.ndarray) -> np.ndarray:
+        """The command as the planner will actually receive it.
+
+        With the stick centred the operator supplies no direction, and the reference
+        implementation substitutes the robot's own measured velocity and facing rather than
+        holding a stale heading. That substitution has to happen *before* the command is compared
+        against the last one: comparing a raw command against a stored post-processed one never
+        matches, and every step looks like a change.
+
+        Args:
+            command: ``(8,)`` operator command in world frame.
+
+        Returns:
+            ``(8,)`` command to plan from, compare against, and store.
+        """
+        if float(command[0]) > 1e-4:
+            return command
+        movement, facing = SonicVelocityPlanner.idle_directions(self._qpos_history)
+        canonical = command.copy()
+        canonical[1:4] = movement
+        canonical[4:7] = facing
+        return canonical
+
     def _replan_needed(self, command: np.ndarray) -> bool:
         """Whether this control step should generate a new trajectory.
 
@@ -578,12 +592,17 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         always replan when the operator's command changes, replan periodically only while actually
         moving, and replan when the current plan is about to run out
         (``planner_onnx.md:362-385``).
+
+        Args:
+            command: Canonical command from :meth:`_canonical_command`.
         """
-        if self._motion is None:
+        if self._motion is None or self._last_command is None:
             return True
-        if self._last_command is None or not np.allclose(command, self._last_command, atol=1e-4):
+        if not np.allclose(command, self._last_command, atol=1e-4):
             return True
-        # Keep enough trajectory ahead to fill the encoder's look-ahead window.
+        # Keep enough trajectory ahead to fill the encoder's look-ahead window. Past the end
+        # PlannerMotion repeats its final pose, so this is what stops the reference going static
+        # rather than what stops an out-of-range read.
         if self._plan_time + float(self._reference_offsets[-1]) >= self._motion.duration:
             return True
         moving = float(command[0]) > 1e-4
@@ -597,30 +616,52 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
             dt: The environment's control period, in seconds.
         """
         planner = self._ensure_planner()
+        canonical = self._canonical_command(command)
 
-        if float(command[0]) <= 1e-4:
-            # No operator input: continue along the robot's own measured motion rather than a
-            # stale commanded heading, as the reference implementation does.
-            movement, facing = SonicVelocityPlanner.idle_directions(self._qpos_history)
-            command = command.copy()
-            command[1:4] = movement
-            command[4:7] = facing
-
-        if self._replan_needed(command):
-            if self._motion is None:
-                self._enter_teleop()
-            else:
-                # Context comes from the plan being played, not from measured robot state, so
-                # successive trajectories are continuous with one another. Sampled a short
-                # look-ahead in, because the new plan takes effect a step or two from now.
-                planner.context_from_motion(self._motion, self._plan_time + PLANNER_LOOKAHEAD_S)
-                self._motion = planner.plan(command, mode=self._planner_clip)
-                self._plan_time = 0.0
+        if self._motion is None:
+            # Fresh entry into walking mode. Build the idle trajectory and stop there: storing the
+            # canonical command means the next step compares like with like and lets that
+            # trajectory actually play, instead of replanning it away before it delivers a frame.
+            self._enter_teleop()
+            self._last_command = canonical
             self._since_replan = 0.0
-            self._last_command = command.copy()
+            return
+
+        if self._replan_needed(canonical):
+            # Context comes from the plan being played, not from measured robot state, so
+            # successive trajectories are continuous with one another. Sampled a short look-ahead
+            # in, because the new plan takes effect a step or two from now.
+            planner.context_from_motion(self._motion, self._plan_time + PLANNER_LOOKAHEAD_S)
+            self._motion = planner.plan(canonical, mode=self._planner_clip)
+            self._plan_time = 0.0
+            self._since_replan = 0.0
+            self._last_command = canonical
         else:
             self._plan_time += dt
             self._since_replan += dt
+
+    def _clear_teleop_slots(self) -> None:
+        """Zero the ``teleop`` blocks when the encoder returns to ``smpl`` mode.
+
+        The checkpoint's contract is that terms outside the active mode are zero -- the deploy
+        stack sends them as zeros rather than omitting them. The encoder observation is a single
+        persistent buffer, and ``fill_smpl_encoder_obs`` only rewrites the ``smpl`` blocks on the
+        assumption that everything else "stays zero for the process lifetime". That assumption
+        predates mode switching: without this, every ``smpl`` frame after a walking excursion
+        carries the last planner window and anchor orientation into the encoder.
+
+        Called on the transition rather than every step: nothing writes these slots while
+        ``smpl`` mode is active, so one pass is enough.
+        """
+        obs = self._policy.encoder_obs
+        for block in (
+            TELEOP_ANCHOR_ORI,
+            TELEOP_LOWER_POS,
+            TELEOP_LOWER_VEL,
+            TELEOP_VR3_POS,
+            TELEOP_VR3_ORN,
+        ):
+            obs[:, block] = 0.0
 
     def _fill_lower_body(self) -> None:
         """Write the encoder's 0.9 s look-ahead window of planned leg motion.
@@ -696,7 +737,7 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         """Run one control step in whichever mode the operator selected.
 
         Args:
-            actions: ``(num_envs, 92)`` ``[reference | mode | command]``.
+            actions: ``(num_envs, 105)`` ``[reference | mode | command | ground]``.
 
         Raises:
             ValueError: If the action width does not match the contract.
@@ -733,10 +774,6 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
         if self._mode == ENCODER_MODE_TELEOP:
             # Planner runs outside inference_mode: it is numpy/onnxruntime and reads articulation
             # state, which the surrounding context does not need to guard.
-            if self._prev_mode != ENCODER_MODE_TELEOP:
-                # Fresh entry: initialize fully before anything reads the plan, so the encoder
-                # never sees a half-built teleop reference.
-                self._enter_teleop()
             self._advance_planner(command, self._control_dt)
 
         from gear_sonic.lab_teleop.mdp.actions import isaaclab_quat_to_wxyz
@@ -751,6 +788,11 @@ class SonicModalWholeBodyAction(SonicWholeBodyAction):
                 base_quat = isaaclab_quat_to_wxyz(self._asset.data.root_quat_w.torch)
                 with self._profiler.stage("encoder_obs_construction"):
                     if self._mode == ENCODER_MODE_SMPL:
+                        if self._prev_mode != ENCODER_MODE_SMPL:
+                            self._clear_teleop_slots()
+                            # Drop the trajectory so re-entry re-initializes from the robot's
+                            # pose at that moment rather than resuming a stale excursion.
+                            self._motion = None
                         encoder_obs = self._build_encoder_obs()
                     else:
                         self._fill_teleop_obs(reference, base_quat)

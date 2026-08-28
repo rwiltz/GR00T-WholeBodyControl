@@ -229,3 +229,125 @@ def test_robot_qpos_places_each_joint_in_its_mujoco_slot() -> None:
 
     expected = [float(angles[G1_ISAACLab_ORDER.index(n)]) for n in LOWER_BODY_JOINTS]
     assert list(legs) == pytest.approx(expected)
+
+
+def _build_term(checkpoint: str = "gear_sonic_deploy/policy/low_latency"):
+    """A modal action term on a fake articulation, plus a neutral-but-valid action vector."""
+    import numpy as np
+    import torch
+
+    from gear_sonic.lab_teleop.assets.g1_sonic import G1_MODEL_12_ACTION_SCALE
+    from gear_sonic.lab_teleop.mdp.modal_actions import (
+        SONIC_MODAL_ACTION_DIM,
+        SonicModalWholeBodyAction,
+        SonicModalWholeBodyActionCfg,
+    )
+    from gear_sonic.lab_teleop.retargeters.sonic_fullbody_retargeter import (
+        SONIC_REFERENCE_DIM,
+        SonicReferenceSlice,
+    )
+    from gear_sonic.lab_teleop.tests.sonic_action_harness import FakeArticulation, FakeEnv
+
+    asset = FakeArticulation(num_envs=1, device="cpu")
+    env = FakeEnv(asset, num_envs=1, device="cpu")
+    env.step_dt = 0.02
+    term = SonicModalWholeBodyAction(
+        SonicModalWholeBodyActionCfg(
+            asset_name="robot",
+            checkpoint_dir=checkpoint,
+            joint_names=[".*"],
+            action_scale=G1_MODEL_12_ACTION_SCALE,
+        ),
+        env,
+    )
+    term.reset()
+
+    reference = np.zeros(SONIC_REFERENCE_DIM, dtype=np.float32)
+    reference[SonicReferenceSlice.ROOT_QUAT.start] = 1.0
+    reference[SonicReferenceSlice.VR3_ORN][0::4] = 1.0
+    reference[SonicReferenceSlice.VALID] = 1.0
+    action = torch.zeros(1, SONIC_MODAL_ACTION_DIM)
+    action[0, :SONIC_REFERENCE_DIM] = torch.from_numpy(reference)
+    return term, asset, action, SONIC_REFERENCE_DIM
+
+
+def test_entering_teleop_plans_once_and_lets_the_idle_trajectory_play() -> None:
+    """Entry must build the idle plan and stop, not replan it away on the same step.
+
+    ``_advance_planner`` substitutes idle directions for a centred stick before planning. If the
+    stored ``_last_command`` is not in that same canonical form, the comparison never matches and
+    the idle trajectory is replaced before it delivers a single frame -- the initialization is
+    real but invisible, and the robot runs a walk clip at zero speed instead.
+    """
+    from gear_sonic.lab_teleop.mdp.sonic_planner import PLANNER_CLIP_IDLE
+
+    term, _asset, action, ref_dim = _build_term()
+    planner = term._ensure_planner()  # noqa: SLF001
+    real_plan, calls = planner.plan, []
+
+    def counting(command, mode=None):
+        calls.append(mode)
+        return real_plan(command, mode) if mode is not None else real_plan(command)
+
+    planner.plan = counting
+
+    action[0, ref_dim] = 2.0  # smpl
+    for _ in range(5):
+        term.process_actions(action)
+        term.apply_actions()
+    assert calls == [], "the planner must not run while in smpl mode"
+
+    action[0, ref_dim] = 1.0  # enter teleop, operator commanding nothing
+    term.process_actions(action)
+    term.apply_actions()
+    assert calls == [PLANNER_CLIP_IDLE], f"entry should plan exactly once, as IDLE; got {calls}"
+
+    for _ in range(10):
+        term.process_actions(action)
+        term.apply_actions()
+    assert calls == [PLANNER_CLIP_IDLE], "a stationary operator must not trigger replans"
+
+
+def test_returning_to_smpl_clears_the_teleop_encoder_slots() -> None:
+    """No teleop values may survive into an ``smpl`` observation.
+
+    The checkpoint's contract is that terms outside the active mode are zero. The encoder
+    observation is one persistent buffer and ``fill_smpl_encoder_obs`` rewrites only the ``smpl``
+    blocks, so without an explicit clear every ``smpl`` frame after a walking excursion carries
+    the last planner window and anchor orientation into the encoder.
+    """
+    import torch
+
+    from gear_sonic.lab_teleop.mdp.modal_actions import (
+        TELEOP_ANCHOR_ORI,
+        TELEOP_LOWER_POS,
+        TELEOP_LOWER_VEL,
+        TELEOP_VR3_ORN,
+        TELEOP_VR3_POS,
+    )
+
+    term, _asset, action, ref_dim = _build_term()
+    blocks = (
+        TELEOP_ANCHOR_ORI,
+        TELEOP_LOWER_POS,
+        TELEOP_LOWER_VEL,
+        TELEOP_VR3_POS,
+        TELEOP_VR3_ORN,
+    )
+
+    for cycle in range(3):
+        action[0, ref_dim] = 1.0
+        for _ in range(20):
+            term.process_actions(action)
+            term.apply_actions()
+        obs = term._policy.encoder_obs[0]  # noqa: SLF001
+        assert sum(float(obs[b].abs().sum()) for b in blocks) > 0.0, "teleop mode should fill them"
+
+        action[0, ref_dim] = 2.0
+        for _ in range(10):
+            term.process_actions(action)
+            term.apply_actions()
+        obs = term._policy.encoder_obs[0]  # noqa: SLF001
+        leaked = sum(float(obs[b].abs().sum()) for b in blocks)
+        assert leaked == pytest.approx(0.0), f"cycle {cycle}: {leaked} leaked into smpl mode"
+        assert bool(torch.isfinite(term._policy.encoder_obs).all())  # noqa: SLF001

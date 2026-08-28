@@ -97,6 +97,13 @@ SONIC_REFERENCE_DT = 1.0 / SONIC_REFERENCE_HZ
 PLANNER_LOOKAHEAD_S = 2.0 * SONIC_REFERENCE_DT
 
 #: Cross-fade duration between an old and a newly arrived plan: upstream's 8-frame blend at 50 Hz.
+#:
+#: **Currently unused, deliberately.** Upstream blends successive trajectories over this window;
+#: we do not, because the instability this integration suffered came from the timing and layout
+#: semantics rather than from plan-to-plan discontinuity, and fixing those resolved it without
+#: blending. Kept because it is the known next lever if changing walking direction or speed shows
+#: a visible step: implement the blend in physical time against this duration, not as a frame
+#: count (``planner_onnx.md:398-410``).
 PLANNER_BLEND_S = 8.0 * SONIC_REFERENCE_DT
 
 #: Planner thread cadence upstream (10 Hz) and the periodic replan interval for walking.
