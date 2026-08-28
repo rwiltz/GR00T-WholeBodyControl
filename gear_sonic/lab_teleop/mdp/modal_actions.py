@@ -745,18 +745,22 @@ The checkpoint's contract is that terms outside the active mode are zero -- the 
         )
         obs[:, TELEOP_ANCHOR_ORI] = anchor.reshape(1, -1)
 
-        # vr_3point positions: the operator's own wrists and head, relative to their own root.
-        #
-        # "local" here means root-normalized, not robot-relative: ``GatherVR3PointPosition``
-        # subtracts the reference's root position and rotates by the inverse root quaternion
-        # (``g1_deploy_onnx_ref.cpp:1157-1170``). The reference already carries its SMPL joints in
-        # exactly that frame, so the points are a slice rather than a transform.
+        # vr_3point positions: the operator's own wrists and head, relative to their own pelvis.
         #
         # No positional offsets are applied. The C++ adds +0.18 along each wrist's X and +0.35 Z
         # on the torso only when *synthesizing* VR points from a robot skeleton; with real tracked
         # head and hands it takes the buffered values directly, which is the case here.
         smpl = reference[:, SonicReferenceSlice.SMPL_JOINTS].reshape(1, 24, 3)
-        obs[:, TELEOP_VR3_POS] = smpl[:, VR3_SMPL_INDICES, :].reshape(1, -1)
+        # Relative to the operator's pelvis, not just rotated into its frame. The reference's SMPL
+        # block divides out the root *rotation* but keeps the translation, so joint 0 sits wherever
+        # forward kinematics put it -- 0.35 m from the origin in a typical frame. Subtracting it
+        # here is what makes these "subtract root position, then rotate by the inverse root
+        # quaternion" (``g1_deploy_onnx_ref.cpp:1157-1176``), which is also how the observation is
+        # defined in training (``observations.py:1348``). Both terms are already in the rotated
+        # frame, so the subtraction commutes with the rotation.
+        obs[:, TELEOP_VR3_POS] = (
+            smpl[:, VR3_SMPL_INDICES, :] - smpl[:, 0:1, :]
+        ).reshape(1, -1)
 
         # vr_3point orientations, already in the anchor frame and already ordered left wrist,
         # right wrist, head. The retargeter computes them because it is the only node that sees
